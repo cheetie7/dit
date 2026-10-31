@@ -1,0 +1,14 @@
+{
+  "source": "robometer",
+  "semantics": "progress_increment_proxy",
+  "model_name": null,
+  "model_version": null,
+  "checkpoint_hash": null,
+  "label_generation_date": null,
+  "training_trajectory_ids": null,
+  "evaluation_trajectory_ids": null,
+  "window_length": 10,
+  "sampling_frequency": 30,
+  "advantage_definition": "Stored annotation.advantage: two non-overlapping 10-transition chunks in a boundary group each receive (P_end-P_start)/2; singleton tail receives full delta. Negative values retained; terminal progress forced to 1. See export_advantage_dataset.py. This is a progress-increment research proxy, not Q-V.",
+  "provenance_reviewed": false
+}

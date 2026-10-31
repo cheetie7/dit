@@ -1,0 +1,13 @@
+{
+  "action_dim": null,
+  "action_horizon": 10,
+  "hidden_dim": 256,
+  "num_layers": 4,
+  "num_heads": 8,
+  "ff_dim": 1024,
+  "dropout": 0.1,
+  "timestep_embedding_dim": 128,
+  "timestep_hidden_dim": 256,
+  "max_period": 10000.0,
+  "norm_eps": 0.000001
+}

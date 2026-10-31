@@ -1,0 +1,79 @@
+{
+  "experiment_name": "fm_h10",
+  "output_root": "outputs",
+  "policy_config": null,
+  "policy": {
+    "dit": {
+      "action_horizon": 10
+    }
+  },
+  "dataset": {
+    "root": "data/block_insertion_real_combined_v30_advantage",
+    "val_fraction": 0.1,
+    "split_seed": 42,
+    "stratify_key": "tasks",
+    "max_train_samples": null,
+    "max_val_samples": null
+  },
+  "training": {
+    "seed": 42,
+    "num_epochs": 200,
+    "batch_size": 16,
+    "num_workers": 4,
+    "gradient_accumulation_steps": 1,
+    "gradient_clip_norm": 1.0,
+    "device": "auto",
+    "max_updates": null,
+    "overfit_one_batch": false,
+    "objective": "fm"
+  },
+  "optimizer": {
+    "name": "adamw",
+    "learning_rate": 0.0001,
+    "backbone_learning_rate": 1e-05,
+    "weight_decay": 0.0001,
+    "no_decay_bias_and_norm": true
+  },
+  "scheduler": {
+    "name": "cosine",
+    "warmup_steps": 500,
+    "min_lr_ratio": 0.01
+  },
+  "amp": {
+    "enabled": true,
+    "dtype": "bfloat16"
+  },
+  "ema": {
+    "enabled": true,
+    "decay": 0.999
+  },
+  "validation": {
+    "interval": 1,
+    "batch_size": 16,
+    "seed": 1234,
+    "use_ema": true
+  },
+  "checkpoint": {
+    "save_interval": 10,
+    "keep_last_n": 3,
+    "update_interval": 0
+  },
+  "logging": {
+    "use_wandb": false,
+    "wandb_mode": "offline",
+    "wandb_project": "dit-flow-baseline",
+    "log_interval": 10
+  },
+  "advantage_weighting": {
+    "enabled": false,
+    "normalization": "zscore",
+    "beta": 1.0,
+    "min_weight": 0.1,
+    "max_weight": 10.0,
+    "detach_weights": true,
+    "labels_path": null,
+    "metadata_path": null,
+    "statistics_path": null,
+    "missing_label_policy": "error"
+  }
+}

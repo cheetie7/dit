@@ -1,0 +1,117 @@
+{
+  "synthetic_only": true,
+  "real_awr_training_started": false,
+  "coverage": {
+    "expected_windows": 12,
+    "label_count": 12,
+    "missing_windows": 0,
+    "missing_label_policy": "error"
+  },
+  "source": {
+    "source": "synthetic_acceptance_only",
+    "model_version": "artificial-v1",
+    "semantics": "advantage",
+    "advantage_definition": "Deterministic artificial scalars; not robot quality or RoboMeter output",
+    "sampling_frequency": 30,
+    "window_length": 10,
+    "training_trajectory_ids": [],
+    "evaluation_trajectory_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "provenance_reviewed": true
+  },
+  "train_advantage_mean": 0.5,
+  "train_advantage_std": 1.7078251838684082,
+  "modes": {
+    "fm": {
+      "global_step": 3,
+      "epoch": 1,
+      "batch_in_epoch": 0,
+      "validation": {
+        "val/loss": 1.3006012439727783,
+        "val/ema_loss": 1.3031431039174397
+      },
+      "ema_updates": 3,
+      "last_epoch": {
+        "epoch": 0,
+        "global_step": 3,
+        "train/loss": 0.9565550287564596,
+        "train/gradient_norm": 3.3078300952911377,
+        "train/learning_rate": 1.0000000000000002e-06,
+        "train/group_lrs": {
+          "visual_projection/decay": 1.0000000000000002e-06,
+          "visual_projection/no_decay": 1.0000000000000002e-06,
+          "observation_encoder/decay": 1.0000000000000002e-06,
+          "observation_encoder/no_decay": 1.0000000000000002e-06,
+          "dit/decay": 1.0000000000000002e-06,
+          "dit/no_decay": 1.0000000000000002e-06
+        },
+        "train/skipped_update": 0,
+        "system/data_time": 0.00010408301022835076,
+        "system/step_time": 0.00607674999628216,
+        "system/gpu_memory": 0,
+        "system/epoch_time": 0.02534183299576398,
+        "val/loss": 1.3006012439727783,
+        "val/ema_loss": 1.3031431039174397
+      },
+      "checkpoint": "outputs/stage8_synthetic-20261031-001729-805710/fm/checkpoints/latest_checkpoint.pt"
+    },
+    "awr_fm": {
+      "global_step": 3,
+      "epoch": 1,
+      "batch_in_epoch": 0,
+      "validation": {
+        "val/loss": 1.3002517422040303,
+        "val/ema_loss": 1.3031422297159831
+      },
+      "ema_updates": 3,
+      "last_epoch": {
+        "epoch": 0,
+        "global_step": 3,
+        "train/loss": 0.981434832324843,
+        "train/gradient_norm": 4.089003562927246,
+        "train/learning_rate": 1.0000000000000002e-06,
+        "train/group_lrs": {
+          "visual_projection/decay": 1.0000000000000002e-06,
+          "visual_projection/no_decay": 1.0000000000000002e-06,
+          "observation_encoder/decay": 1.0000000000000002e-06,
+          "observation_encoder/no_decay": 1.0000000000000002e-06,
+          "dit/decay": 1.0000000000000002e-06,
+          "dit/no_decay": 1.0000000000000002e-06
+        },
+        "train/skipped_update": 0,
+        "system/data_time": 9.387500176671892e-05,
+        "system/step_time": 0.005986250005662441,
+        "system/gpu_memory": 0,
+        "train/unweighted_loss": 0.9567579627037048,
+        "train/weighted_loss": 0.981434832324843,
+        "advantage/mean": 0.5,
+        "advantage/std": 1.707825127659933,
+        "advantage/min": -2.0,
+        "advantage/max": 3.0,
+        "advantage/median": 0.5,
+        "weight/mean": 3.069702963034312,
+        "weight/std": 3.6650072142508185,
+        "weight/min": 0.09999999403953552,
+        "weight/max": 10.0,
+        "weight/clip_fraction": 0.3333333333333333,
+        "weight/effective_sample_size": 2.473751108269235,
+        "weight/ess_ratio": 0.41229185137820584,
+        "weight/largest_trajectory_mass_fraction": 0.9549667347038727,
+        "weight/minimum_fraction": 0.16666666666666666,
+        "weight/trajectory_mass_fraction": {
+          "0": 0.04503326529612728,
+          "1": 0.9549667347038727
+        },
+        "system/epoch_time": 0.018858916984754615,
+        "val/loss": 1.3002517422040303,
+        "val/ema_loss": 1.3031422297159831
+      },
+      "checkpoint": "outputs/stage8_synthetic-20261031-001729-805710/awr_fm/checkpoints/latest_checkpoint.pt"
+    }
+  },
+  "run_directory": "/private/tmp/outputs/stage8_synthetic-20261031-001729-805710"
+}

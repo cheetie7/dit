@@ -1,0 +1,62 @@
+{
+  "experiment_name": "fm_overfit_one_batch",
+  "output_root": "outputs",
+  "policy_config": null,
+  "policy": {
+    "observation": {
+      "dropout": 0.0
+    },
+    "dit": {
+      "dropout": 0.0
+    }
+  },
+  "dataset": {
+    "root": "data/block_insertion_real_combined_v30_advantage",
+    "val_fraction": 0.1,
+    "split_seed": 42,
+    "stratify_key": "tasks",
+    "max_train_samples": 2,
+    "max_val_samples": 2
+  },
+  "training": {
+    "seed": 42,
+    "num_epochs": 1,
+    "batch_size": 2,
+    "num_workers": 0,
+    "gradient_accumulation_steps": 1,
+    "gradient_clip_norm": 1.0,
+    "device": "cpu",
+    "max_updates": 24,
+    "overfit_one_batch": true,
+    "overfit_batches": 24,
+    "objective": "fm"
+  },
+  "optimizer": {
+    "learning_rate": 0.0005,
+    "backbone_learning_rate": 1e-05,
+    "weight_decay": 0.0001
+  },
+  "scheduler": {
+    "warmup_steps": 0,
+    "min_lr_ratio": 1.0
+  },
+  "amp": {
+    "enabled": false,
+    "dtype": "float32"
+  },
+  "ema": {
+    "enabled": false
+  },
+  "validation": {
+    "interval": 0,
+    "batch_size": 2
+  },
+  "checkpoint": {
+    "save_interval": 0,
+    "keep_last_n": 3
+  },
+  "logging": {
+    "use_wandb": false,
+    "log_interval": 1
+  }
+}

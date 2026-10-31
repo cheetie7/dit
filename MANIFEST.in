@@ -1,0 +1,7 @@
+include README.md train.py
+recursive-include configs *.json
+exclude configs/*.local.json
+recursive-include docs *.md *.json *.png
+recursive-include tests *.py
+recursive-include tools *.py *.md
+global-exclude __pycache__ *.py[cod] .DS_Store
