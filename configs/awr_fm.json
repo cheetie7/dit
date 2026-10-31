@@ -18,6 +18,7 @@
   "training": {
     "seed": 42,
     "num_epochs": 200,
+    "num_steps": null,
     "batch_size": 16,
     "num_workers": 4,
     "gradient_accumulation_steps": 1,
@@ -25,8 +26,7 @@
     "device": "auto",
     "max_updates": null,
     "overfit_one_batch": false,
-    "objective": "awr_fm",
-    "num_steps": null
+    "objective": "awr_fm"
   },
   "optimizer": {
     "name": "adamw",

@@ -39,6 +39,14 @@ def main():
         config = ExperimentConfig.from_dict(apply_overrides(state["config"], args.overrides))
     else:
         config = ExperimentConfig.from_dict(apply_overrides({}, args.overrides))
+    source = (str(args.config.resolve()) if args.config else
+              f"{args.resume.resolve()} (checkpoint config)" if args.resume else "package defaults")
+    print(f"Config source: {source}", flush=True)
+    print(f"Trainer source: {Path(__file__).with_name('trainer.py').resolve()}", flush=True)
+    if config.training.num_steps is not None:
+        print(f"Training budget: steps={config.training.num_steps}; num_epochs is ignored", flush=True)
+    else:
+        print(f"Training budget: epochs={config.training.num_epochs}; training.num_steps=null", flush=True)
     seed_everything(config.training.seed)
     info = json.loads((Path(config.dataset.root) / "meta/info.json").read_text())
     policy_config = (FlowMatchingPolicyConfig.from_dict(state["policy_config"]) if state is not None

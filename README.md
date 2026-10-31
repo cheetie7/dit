@@ -92,6 +92,8 @@ awbc-train --config configs/fm.json \
 
 `num_steps` 设置后优先于 `num_epochs`，同时控制训练终点和 warmup/cosine 的总长度。未设置时继续按 epoch 预算计算；`max_updates` 仍仅用于提前停止诊断，不改变学习率调度长度。Epoch 是遍历一次训练集；step 是一次成功的 optimizer update，梯度累积的多个 minibatch 合起来才算一步，也不等于机器人动作步或 Flow 时间 t。
 
+示例配置默认 `num_steps: null`。只覆盖 dataset.root/device 不会启用 step 预算；需编辑实际传入的配置文件，或显式增加 `--set training.num_steps=50000`。启动会打印 Config source、Trainer source 和最终 Training budget。看到 `Training budget: steps=50000; num_epochs is ignored` 才表示启用了该预算；进度条中的 epoch 仍会增长，用来表示数据已遍历的轮数。`--resume` 没有同时传 `--config` 时使用 checkpoint 保存的配置，可用 `--set` 覆盖；同一次恢复保留原 scheduler 总预算。
+
 默认 tqdm 显示全局更新进度、epoch、loss、LR、速度和 ETA；AMP 跳过更新时进度不增加，resume 从保存的 global_step 接续。验证有单独 batch 进度。设置 `logging.progress_bar=false` 可关闭，CSV/JSONL/WandB 日志不受影响。
 
 ## 断点恢复

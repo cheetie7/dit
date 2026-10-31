@@ -21,6 +21,7 @@
   "training": {
     "seed": 42,
     "num_epochs": 1,
+    "num_steps": null,
     "batch_size": 2,
     "num_workers": 0,
     "gradient_accumulation_steps": 1,
@@ -29,8 +30,7 @@
     "max_updates": 24,
     "overfit_one_batch": true,
     "overfit_batches": 24,
-    "objective": "fm",
-    "num_steps": null
+    "objective": "fm"
   },
   "optimizer": {
     "learning_rate": 0.0005,

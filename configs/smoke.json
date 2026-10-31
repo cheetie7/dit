@@ -13,14 +13,14 @@
   "training": {
     "seed": 42,
     "num_epochs": 2,
+    "num_steps": null,
     "batch_size": 2,
     "num_workers": 0,
     "gradient_accumulation_steps": 2,
     "gradient_clip_norm": 1.0,
     "device": "cpu",
     "max_updates": 3,
-    "objective": "fm",
-    "num_steps": null
+    "objective": "fm"
   },
   "optimizer": {
     "learning_rate": 0.0001,

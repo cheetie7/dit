@@ -9,6 +9,7 @@ from awbc_training.config import ExperimentConfig
 from awbc_training.ema import EMA
 from awbc_training.inference import load_policy
 from test_advantage_weighting import tiny_policy
+from test_awbc_data import root
 
 
 def test_bundled_model_configuration_works_outside_project(monkeypatch, tmp_path):
@@ -49,3 +50,39 @@ def test_checkpoint_without_ema_reports_explicit_request(tmp_path):
                 'policy_config': asdict(policy.config), 'normalization_stats': stats}, path)
     with pytest.raises(ValueError, match='no EMA'):
         load_policy(path, use_ema=True, device='cpu')
+
+
+@pytest.mark.parametrize('override', [None, 5])
+def test_real_cli_uses_file_step_budget_and_cli_override(root, tmp_path, monkeypatch, capsys, override):
+    import json
+    from awbc_training.train import main
+    config = ExperimentConfig()
+    config.dataset.root = str(root)
+    config.dataset.stratify_key = None
+    config.training.num_epochs = 1
+    config.training.num_steps = 3
+    config.training.device = 'cpu'
+    config.training.batch_size = 2
+    config.training.num_workers = 0
+    config.amp.enabled = config.ema.enabled = config.logging.use_wandb = config.logging.progress_bar = False
+    config.scheduler.warmup_steps = 0
+    policy, _ = tiny_policy()
+    config.policy = asdict(policy.config)
+    config.policy['dit'].pop('action_dim')  # Derive the actual action dimension from the dataset.
+    config.policy.pop('camera_names')
+    config.policy['image_preprocess']['size'] = [32, 48]
+    config.policy['normalization_stats_path'] = None
+    path = tmp_path/'training.json'
+    config.to_json(path)
+    output = tmp_path/'cli_run'
+    argv = ['awbc-train', '--config', str(path), '--run-dir', str(output)]
+    if override is not None:
+        argv += ['--set', f'training.num_steps={override}']
+    monkeypatch.setattr('sys.argv', argv)
+    main()
+    expected = override or 3
+    state = torch.load(output/'checkpoints/latest_checkpoint.pt', weights_only=False)
+    assert state['total_steps'] == state['global_step'] == state['scheduler']['last_epoch'] == expected
+    assert state['epoch'] == expected  # one update/epoch: original num_epochs=1 cannot cap it
+    assert json.loads((output/'config.json').read_text())['training']['num_steps'] == expected
+    assert f'Training budget: steps={expected}; num_epochs is ignored' in capsys.readouterr().out
