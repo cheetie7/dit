@@ -43,7 +43,8 @@
     "interval": 1,
     "batch_size": 2,
     "seed": 1234,
-    "use_ema": true
+    "use_ema": true,
+    "update_interval": 0
   },
   "checkpoint": {
     "save_interval": 1,

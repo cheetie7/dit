@@ -37,6 +37,8 @@ class Trainer:
         self.epoch_loss_sum = self.epoch_samples = self.epoch_seconds = 0
         self.fixed_pair = None
         self.last_update_metrics = {}
+        self.last_validation_step = -1
+        self.last_validation = {}
         if config.training.objective not in ("fm", "awr_fm"):
             raise ValueError("training.objective must be fm or awr_fm")
         self.weighting = weighting.to(device) if weighting is not None and config.training.objective == "awr_fm" else None
@@ -53,6 +55,10 @@ class Trainer:
         self.logger.logger.info("Device=%s AMP=%s scaler=%s planned updates=%s", device,
                                 config.amp.dtype if self.precision.enabled else "float32",
                                 self.precision.scaler.is_enabled(), self.total_steps)
+        for name, steps, epochs in (("Validation", config.validation.update_interval, config.validation.interval),
+                                    ("Periodic checkpoint", config.checkpoint.update_interval, config.checkpoint.save_interval)):
+            frequency = f"every {steps} optimizer updates" if steps else f"every {epochs} epochs" if epochs else "disabled"
+            self.logger.logger.info("%s schedule: %s", name, frequency)
 
     def epoch_batches(self):
         if self.config.training.overfit_one_batch:
@@ -113,13 +119,14 @@ class Trainer:
                 "total_steps": self.total_steps, "last_update_metrics": self.last_update_metrics,
                 "advantage_weighting": self.weighting.state_dict() if self.weighting else None,
                 "epoch_awr_rows": self.epoch_awr_rows, "epoch_weighted_sum": self.epoch_weighted_sum,
-                "epoch_weight_sum": self.epoch_weight_sum}
+                "epoch_weight_sum": self.epoch_weight_sum,
+                "last_validation_step": self.last_validation_step, "last_validation": self.last_validation}
 
     def load_state(self, state):
         if state["normalization_stats"] != self.stats or state["split"] != self.manifest:
             raise ValueError("Resume dataset split/statistics differ from the checkpoint")
         if state["total_steps"] != self.total_steps:
-            raise ValueError("Resume must retain the original epoch/batch/accumulation schedule")
+            raise ValueError("Resume must retain the original total optimizer-update budget")
         original = state["config"]["training"]
         if original.get("objective", "fm") != self.config.training.objective:
             raise ValueError("Resume cannot change the training objective; start a separate comparison run")
@@ -139,14 +146,23 @@ class Trainer:
         self.epoch_awr_rows = state.get("epoch_awr_rows", [])
         self.epoch_weighted_sum = state.get("epoch_weighted_sum", 0.)
         self.epoch_weight_sum = state.get("epoch_weight_sum", 0.)
+        self.last_validation_step = state.get("last_validation_step", -1)
+        self.last_validation = state.get("last_validation", {})
         for name in ("epoch", "batch_in_epoch", "global_step", "epoch_loss_sum", "epoch_samples", "epoch_seconds", "fixed_pair", "last_update_metrics"):
             setattr(self, name, state[name])
         restore_rng(state["rng_state"])
 
-    def save(self, periodic=False):
+    def save(self, periodic=False, *, step_periodic=False):
         config = self.config.checkpoint
         save_checkpoint(self.state_dict(), self.directory / "checkpoints",
-                        epoch_number=self.epoch if periodic else None, keep_last_n=config.keep_last_n)
+                        epoch_number=self.epoch if periodic else None, keep_last_n=config.keep_last_n,
+                        step_number=self.global_step if step_periodic else None)
+
+    def _validate_and_log(self):
+        self.last_validation = self.validate()
+        self.last_validation_step = self.global_step
+        self.logger.log({"epoch": self.epoch, "global_step": self.global_step, **self.last_validation})
+        self.policy.train()
 
     def fit(self):
         with logging_redirect_tqdm(loggers=[self.logger.logger]), tqdm(
@@ -160,7 +176,6 @@ class Trainer:
             torch.cuda.reset_peak_memory_stats(self.device)
         self.optimizer.zero_grad(set_to_none=True)
         parameters = [p for p in self.policy.parameters() if p.requires_grad]
-        last_validation = {}
         while (self.global_step < self.total_steps if config.num_steps is not None else self.epoch < config.num_epochs):
             if config.max_updates is not None and self.global_step >= config.max_updates:
                 break
@@ -172,6 +187,7 @@ class Trainer:
             window_loss = window_samples = window_data_time = window_batch_time = 0
             window_weighted_sum = window_weight_sum = 0.
             window_awr_rows = []
+            step_checkpoint_due = False
             for index, batch in enumerate(loader, start=start_batch):
                 data_time = perf_counter()-end
                 start = perf_counter()
@@ -261,10 +277,17 @@ class Trainer:
                     window_loss = window_samples = window_data_time = window_batch_time = 0
                     window_weighted_sum = window_weight_sum = 0.
                     window_awr_rows = []
-                    if self.config.checkpoint.update_interval and updated and self.global_step % self.config.checkpoint.update_interval == 0:
-                        self.save()
-                    if ((config.max_updates is not None and self.global_step >= config.max_updates)
-                            or (config.num_steps is not None and self.global_step >= self.total_steps)):
+                    validation_interval = self.config.validation.update_interval
+                    if updated and validation_interval and self.global_step % validation_interval == 0:
+                        self._validate_and_log()
+                    stop_requested = ((config.max_updates is not None and self.global_step >= config.max_updates)
+                                      or (config.num_steps is not None and self.global_step >= self.total_steps))
+                    checkpoint_interval = self.config.checkpoint.update_interval
+                    step_checkpoint_due = bool(updated and checkpoint_interval and self.global_step % checkpoint_interval == 0)
+                    # At epoch boundaries or stopping points, save after advancing the data cursor below.
+                    if step_checkpoint_due and not stop_requested and index+1 < len(batches):
+                        self.save(step_periodic=True)
+                    if stop_requested:
                         break
                 end = perf_counter()
             completed = self.batch_in_epoch == len(batches)
@@ -280,9 +303,15 @@ class Trainer:
                                self.weighting.min_weight)
             stopping = ((config.max_updates is not None and self.global_step >= config.max_updates)
                         or (config.num_steps is not None and self.global_step >= self.total_steps))
-            if self.config.validation.interval and ((self.epoch+1) % self.config.validation.interval == 0 or stopping):
-                last_validation = self.validate()
-                epoch_metrics.update(last_validation)
+            finished = stopping or (completed and config.num_steps is None and self.epoch+1 >= config.num_epochs)
+            validation = self.config.validation
+            epoch_validation_due = (not validation.update_interval and validation.interval and completed
+                                    and (self.epoch+1) % validation.interval == 0)
+            final_validation_due = finished and (validation.update_interval or validation.interval)
+            if (epoch_validation_due or final_validation_due) and self.last_validation_step != self.global_step:
+                self._validate_and_log()
+            if self.last_validation_step == self.global_step:
+                epoch_metrics.update(self.last_validation)
             self.logger.log(epoch_metrics)
             if completed:
                 self.epoch += 1
@@ -290,7 +319,10 @@ class Trainer:
                 self.epoch_loss_sum = self.epoch_samples = self.epoch_seconds = 0
                 self.epoch_awr_rows = []
                 self.epoch_weighted_sum = self.epoch_weight_sum = 0.
-            periodic = completed and self.config.checkpoint.save_interval and self.epoch % self.config.checkpoint.save_interval == 0
-            self.save(periodic=periodic)
+            checkpoint = self.config.checkpoint
+            periodic = (not checkpoint.update_interval and completed and checkpoint.save_interval
+                        and self.epoch % checkpoint.save_interval == 0)
+            if not checkpoint.update_interval or step_checkpoint_due or finished:
+                self.save(periodic=periodic, step_periodic=step_checkpoint_due)
         return {"global_step": self.global_step, "epoch": self.epoch, "batch_in_epoch": self.batch_in_epoch,
-                "validation": last_validation, "ema_updates": self.ema.num_updates if self.ema else 0}
+                "validation": self.last_validation, "ema_updates": self.ema.num_updates if self.ema else 0}

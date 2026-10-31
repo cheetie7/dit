@@ -53,7 +53,7 @@ class ToyPolicy(nn.Module):
 
 
 def trainer(tmp_path, name, *, batch_size=2, accumulation=2, max_updates=2, epochs=2,
-            state=None, stochastic=False, n=9, num_steps=None):
+            state=None, stochastic=False, n=9, num_steps=None, validation_steps=0, checkpoint_steps=0):
     directory = tmp_path / name
     directory.mkdir()
     config = ExperimentConfig()
@@ -63,6 +63,8 @@ def trainer(tmp_path, name, *, batch_size=2, accumulation=2, max_updates=2, epoc
     config.amp.enabled = False
     config.scheduler.warmup_steps = 0
     config.validation.batch_size = 3
+    config.validation.update_interval = validation_steps
+    config.checkpoint.update_interval = checkpoint_steps
     config.logging.use_wandb = False
     config.logging.log_interval = 1
     model = ToyPolicy(stochastic=stochastic)
@@ -269,22 +271,105 @@ def record_progress(monkeypatch):
 def test_step_budget_overrides_epochs_and_resumes_progress_and_schedule(tmp_path, monkeypatch):
     bars = record_progress(monkeypatch)
     seed_everything(9)
-    whole = trainer(tmp_path, 'steps_whole', num_steps=5, epochs=1, max_updates=None, n=5, stochastic=True)
+    whole = trainer(tmp_path, 'steps_whole', num_steps=5, epochs=1, max_updates=None, n=5, stochastic=True,
+                    validation_steps=2, checkpoint_steps=2)
     whole.fit()
     assert whole.total_steps == whole.global_step == whole.scheduler.last_epoch == whole.ema.num_updates == 5
     assert whole.epoch > 1 and bars[0].total == bars[0].n == 5
     seed_everything(9)
-    first = trainer(tmp_path, 'steps_first', num_steps=5, epochs=1, max_updates=3, n=5, stochastic=True)
+    first = trainer(tmp_path, 'steps_first', num_steps=5, epochs=1, max_updates=3, n=5, stochastic=True,
+                    validation_steps=2, checkpoint_steps=2)
     first.fit()
     state = torch.load(first.directory/'checkpoints/latest_checkpoint.pt', weights_only=False)
     resumed = trainer(tmp_path, 'steps_resumed', num_steps=5, epochs=1, max_updates=None, n=5,
-                      stochastic=True, state=state)
+                      stochastic=True, state=state, validation_steps=2, checkpoint_steps=2)
+    assert resumed.last_validation_step == 3 and resumed.last_validation == state['last_validation']
     resumed.fit()
     assert bars[-1].initial == 3 and bars[-1].n == bars[-1].total == 5
     for a, b in zip(whole.policy.parameters(), resumed.policy.parameters()):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
     for run in (whole, first, resumed):
         run.logger.close()
+
+
+def test_step_intervals_ignore_epochs_restore_train_mode_and_keep_checkpoints(tmp_path, monkeypatch):
+    run = trainer(tmp_path, 'intervals', num_steps=7, epochs=1, max_updates=None,
+                  validation_steps=2, checkpoint_steps=2, stochastic=True)
+    run.config.checkpoint.save_interval = 1  # Step interval takes priority.
+    run.config.checkpoint.keep_last_n = 2
+    calls = []
+    original = run.validate
+    def validate():
+        calls.append(run.global_step)
+        return original()
+    monkeypatch.setattr(run, 'validate', validate)
+    def check_training(module, args):
+        if torch.is_grad_enabled():
+            assert module.training  # Intra-epoch validation must not disable dropout in training.
+    handle = run.policy.register_forward_pre_hook(check_training)
+    result = run.fit()
+    assert calls == [2, 4, 6, 7]  # No extra epoch validation at step 3; step 6 validated only once.
+    assert result['validation'] == run.last_validation
+    files = run.directory/'checkpoints'
+    assert [p.name for p in sorted(files.glob('step_*.pt'))] == ['step_00000004.pt', 'step_00000006.pt']
+    assert not list(files.glob('epoch_*.pt'))
+    boundary = torch.load(files/'step_00000006.pt', weights_only=False)
+    assert boundary['epoch'] == 2 and boundary['batch_in_epoch'] == 0
+    final = torch.load(files/'latest_checkpoint.pt', weights_only=False)
+    assert final['global_step'] == final['last_validation_step'] == 7
+    assert final['last_validation'] == run.last_validation
+    handle.remove()
+    run.logger.close()
+
+
+def test_step_events_do_not_repeat_after_skipped_update(tmp_path, monkeypatch):
+    class SkipPatternScaler:
+        def __init__(self): self.attempt, self.value = 0, 2.
+        def scale(self, loss): return loss
+        def unscale_(self, optimizer): pass
+        def get_scale(self): return self.value
+        def is_enabled(self): return True
+        def step(self, optimizer):
+            if self.attempt not in (0, 3): optimizer.step()
+        def update(self):
+            if self.attempt in (0, 3): self.value *= 0.5
+            self.attempt += 1
+        def state_dict(self): return {'scale': self.value}
+    run = trainer(tmp_path, 'skipped_events', n=8, epochs=4, max_updates=3,
+                  validation_steps=2, checkpoint_steps=2)
+    run.precision.scaler = SkipPatternScaler()
+    validations, saves = [], []
+    original_validate, original_save = run.validate, run.save
+    def validate():
+        validations.append(run.global_step)
+        return original_validate()
+    def save(periodic=False, *, step_periodic=False):
+        saves.append((run.global_step, step_periodic))
+        original_save(periodic, step_periodic=step_periodic)
+    monkeypatch.setattr(run, 'validate', validate)
+    monkeypatch.setattr(run, 'save', save)
+    run.fit()
+    assert validations == [2, 3]
+    assert saves == [(2, True), (3, False)]
+    assert run.global_step == run.scheduler.last_epoch == run.ema.num_updates == 3
+    run.logger.close()
+
+
+def test_epoch_budget_also_finalizes_step_schedules(tmp_path, monkeypatch):
+    run = trainer(tmp_path, 'epoch_budget_step_events', epochs=1, max_updates=None,
+                  validation_steps=2, checkpoint_steps=2)
+    calls = []
+    original = run.validate
+    def validate():
+        calls.append(run.global_step)
+        return original()
+    monkeypatch.setattr(run, 'validate', validate)
+    run.fit()
+    assert calls == [2, 3]
+    state = torch.load(run.directory/'checkpoints/latest_checkpoint.pt', weights_only=False)
+    assert state['epoch'] == 1 and state['batch_in_epoch'] == 0
+    assert state['global_step'] == state['last_validation_step'] == 3
+    run.logger.close()
 
 
 def test_wandb_failure_keeps_local_logging(tmp_path, monkeypatch):

@@ -96,6 +96,18 @@ awbc-train --config configs/fm.json \
 
 默认 tqdm 显示全局更新进度、epoch、loss、LR、速度和 ETA；AMP 跳过更新时进度不增加，resume 从保存的 global_step 接续。验证有单独 batch 进度。设置 `logging.progress_bar=false` 可关闭，CSV/JSONL/WandB 日志不受影响。
 
+FM/AWR-FM 配置默认每 1,000 次更新验证、每 5,000 次更新保存，可独立调整：
+
+```bash
+awbc-train --config configs/fm.json \
+  --set dataset.root=/path/to/dataset \
+  --set training.num_steps=50000 \
+  --set validation.update_interval=1000 \
+  --set checkpoint.update_interval=5000
+```
+
+两个 update_interval 都以成功的 optimizer update 计数，正数优先于原有 epoch 间隔，梯度累积和 AMP 跳过更新不会多计。定期保存 `step_00005000.pt` 并更新 latest，保留最近 keep_last_n 个 step 文件。到达训练终点或 max_updates 停止点时额外更新 latest，并在启用验证时补一次最终验证；同一步同时命中间隔和结束条件只验证一次。Step 模式不会在每个 epoch 再额外触发验证/保存。两个验证间隔均设为 0 时关闭验证；要恢复 epoch 频率，设 update_interval=0 并设置原 interval/save_interval。
+
 ## 断点恢复
 
 ```bash
@@ -107,7 +119,7 @@ awbc-train --resume outputs/<run>/checkpoints/latest_checkpoint.pt \
 
 恢复 optimizer、scheduler、scaler、EMA、随机状态和数据位置。相同实验保持原数据划分、batch/累积与总调度；10 步新实验不覆盖以前的 16 步实验。旧 checkpoint 按保存的模型配置恢复，checkpoint 内已含视觉骨干权重，恢复和推理不需要再次下载 ImageNet 权重。
 
-每次新实验使用唯一目录，保存完整配置、模型配置、划分、训练集归一化统计、来源记录、CSV/JSONL 日志，以及 latest 和定期 checkpoint。按现有要求不实现 best checkpoint。
+每次新实验使用唯一目录，保存完整配置、模型配置、划分、训练集归一化统计、来源记录、CSV/JSONL 日志，以及 latest 和定期 checkpoint。恢复时沿用 global_step 的间隔倍数和已完成验证记录；step/epoch 同类型的定期文件各保留最近 N 个。按现有要求不实现 best checkpoint。
 
 ## 离线推理接口
 

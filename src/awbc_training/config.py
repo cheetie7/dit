@@ -63,6 +63,7 @@ class EMAConfig:
 @dataclass
 class ValidationConfig:
     interval: int = 1
+    update_interval: int = 0  # Positive values override the epoch interval.
     batch_size: int = 16
     seed: int = 1234
     use_ema: bool = True
@@ -72,7 +73,7 @@ class ValidationConfig:
 class CheckpointConfig:
     save_interval: int = 10
     keep_last_n: int = 3
-    update_interval: int = 0
+    update_interval: int = 0  # Positive values override save_interval (epochs).
 
 
 @dataclass

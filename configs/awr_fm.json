@@ -49,15 +49,16 @@
     "decay": 0.999
   },
   "validation": {
-    "interval": 1,
+    "interval": 0,
     "batch_size": 16,
     "seed": 1234,
-    "use_ema": true
+    "use_ema": true,
+    "update_interval": 1000
   },
   "checkpoint": {
-    "save_interval": 10,
+    "save_interval": 0,
     "keep_last_n": 3,
-    "update_interval": 0
+    "update_interval": 5000
   },
   "logging": {
     "use_wandb": false,

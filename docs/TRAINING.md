@@ -28,12 +28,19 @@ outputs/<experiment>-<timestamp>/
   advantage_analysis/                              # AWR 分布图与逐窗口诊断
   checkpoints/
     latest_checkpoint.pt
-    epoch_XXXX.pt
+    step_XXXXXXXX.pt            # step 保存模式
+    epoch_XXXX.pt               # 兼容的 epoch 保存模式
 ```
 
 Checkpoint 临时写入后原子替换，保留最近 N 个定期文件，不保存 best。恢复全部训练状态及数据位置；AWR 同时恢复 normalizer buffers 和未完成 epoch 的诊断统计。已有 checkpoint 模块名保持兼容。外部数据需保持可访问，换机器时可以覆盖 dataset.root；变更数据内容/划分/统计会拒绝作为同一次实验恢复。
 
-训练预算支持 `training.num_steps`（成功的优化器更新次数）。设为整数时覆盖 num_epochs，scheduler 也使用这个总长度；null 时 `total_steps=ceil(ceil(N/batch_size)/accumulation)*num_epochs`。max_updates 是独立的诊断停止点，恢复时可延后，但保留原 scheduler 总长度。验证与定期 epoch checkpoint 的间隔仍按 epoch，checkpoint.update_interval 支持按优化器更新次数保存。
+训练预算支持 `training.num_steps`（成功的优化器更新次数）。设为整数时覆盖 num_epochs，scheduler 也使用这个总长度；null 时 `total_steps=ceil(ceil(N/batch_size)/accumulation)*num_epochs`。max_updates 是独立的诊断停止点，恢复时可延后，但保留原 scheduler 总长度。
+
+`validation.update_interval` 和 `checkpoint.update_interval` 是成功更新次数间隔；正数优先于 validation.interval / checkpoint.save_interval 的 epoch 规则。FM/AWR-FM 示例分别为 1000 / 5000，epoch 间隔设为 0。旧配置未提供新验证字段时默认 0，继续原 epoch 行为。启动日志打印实际调度方式。
+
+Step 验证发生在 optimizer、scheduler、EMA 更新后；验证结束立即恢复训练模式，不影响后续 dropout。跳过更新时不触发 step 事件。训练结束或 max_updates 停止时，在验证已启用的前提下确保当前权重有一次验证，并确保 latest 已保存；间隔与终点重合时不会重复验证。所有验证间隔为 0 则不验证。
+
+Step 保存生成 latest 和 step_XXXXXXXX.pt，按 keep_last_n 保留同类型最近文件；step 模式不在普通 epoch 边界额外保存。边界触发的保存放在数据位置更新之后，恢复时不会回退到上一轮。Checkpoint 保存 last_validation_step / last_validation，避免结束或恢复时重复计算同一步验证，旧 checkpoint 缺失这两个字段时仍可恢复。验证/保存频率可在 resume 时覆盖，不改变 scheduler 总训练预算。
 
 默认 tqdm 的全局条按成功更新计数、恢复时使用 global_step 初始化；postfix 显示 epoch/loss/LR。验证条按 batch 计数，不影响训练条。logging.progress_bar=false 关闭显示；终端 logging 在进度条间正确换行，文件日志保留完整指标。
 
