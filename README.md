@@ -82,6 +82,18 @@ awbc-train --config configs/awr_fm.json \
 
 训练默认关闭 WandB，仅写本地日志；需要时设置 `logging.use_wandb=true` 和 `logging.wandb_mode=offline/online`。AdamW、warmup/cosine、AMP、梯度累积/裁剪、EMA、验证、checkpoint 间隔都可通过 JSON 或 `--set key=value` 修改。
 
+可以直接按总优化器更新次数训练：
+
+```bash
+awbc-train --config configs/fm.json \
+  --set dataset.root=/path/to/dataset \
+  --set training.num_steps=50000
+```
+
+`num_steps` 设置后优先于 `num_epochs`，同时控制训练终点和 warmup/cosine 的总长度。未设置时继续按 epoch 预算计算；`max_updates` 仍仅用于提前停止诊断，不改变学习率调度长度。Epoch 是遍历一次训练集；step 是一次成功的 optimizer update，梯度累积的多个 minibatch 合起来才算一步，也不等于机器人动作步或 Flow 时间 t。
+
+默认 tqdm 显示全局更新进度、epoch、loss、LR、速度和 ETA；AMP 跳过更新时进度不增加，resume 从保存的 global_step 接续。验证有单独 batch 进度。设置 `logging.progress_bar=false` 可关闭，CSV/JSONL/WandB 日志不受影响。
+
 ## 断点恢复
 
 ```bash

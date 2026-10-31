@@ -53,11 +53,11 @@ class ToyPolicy(nn.Module):
 
 
 def trainer(tmp_path, name, *, batch_size=2, accumulation=2, max_updates=2, epochs=2,
-            state=None, stochastic=False, n=9):
+            state=None, stochastic=False, n=9, num_steps=None):
     directory = tmp_path / name
     directory.mkdir()
     config = ExperimentConfig()
-    config.training = replace(config.training, num_epochs=epochs, batch_size=batch_size, num_workers=0,
+    config.training = replace(config.training, num_epochs=epochs, num_steps=num_steps, batch_size=batch_size, num_workers=0,
                               gradient_accumulation_steps=accumulation, max_updates=max_updates,
                               gradient_clip_norm=100., device="cpu")
     config.amp.enabled = False
@@ -230,7 +230,8 @@ def test_warmup_cosine_update_schedule():
     assert scheduler.last_epoch == 6
 
 
-def test_skipped_scaled_update_does_not_step_scheduler_or_ema(tmp_path):
+def test_skipped_scaled_update_does_not_step_scheduler_or_ema(tmp_path, monkeypatch):
+    bars = record_progress(monkeypatch)
     class SkipOnceScaler:
         def __init__(self):
             self.value, self.first = 2., True
@@ -248,7 +249,42 @@ def test_skipped_scaled_update_does_not_step_scheduler_or_ema(tmp_path):
     run.precision.scaler = SkipOnceScaler()
     run.fit()
     assert run.global_step == run.scheduler.last_epoch == run.ema.num_updates == 2
+    assert bars[0].n == 2
     run.logger.close()
+
+
+def record_progress(monkeypatch):
+    import awbc_training.trainer as module
+    original, bars = module.tqdm, []
+    def tracked(*args, **kwargs):
+        kwargs['disable'] = False
+        bar = original(*args, **kwargs)
+        if kwargs.get('desc') == 'Training':
+            bars.append(bar)
+        return bar
+    monkeypatch.setattr(module, 'tqdm', tracked)
+    return bars
+
+
+def test_step_budget_overrides_epochs_and_resumes_progress_and_schedule(tmp_path, monkeypatch):
+    bars = record_progress(monkeypatch)
+    seed_everything(9)
+    whole = trainer(tmp_path, 'steps_whole', num_steps=5, epochs=1, max_updates=None, n=5, stochastic=True)
+    whole.fit()
+    assert whole.total_steps == whole.global_step == whole.scheduler.last_epoch == whole.ema.num_updates == 5
+    assert whole.epoch > 1 and bars[0].total == bars[0].n == 5
+    seed_everything(9)
+    first = trainer(tmp_path, 'steps_first', num_steps=5, epochs=1, max_updates=3, n=5, stochastic=True)
+    first.fit()
+    state = torch.load(first.directory/'checkpoints/latest_checkpoint.pt', weights_only=False)
+    resumed = trainer(tmp_path, 'steps_resumed', num_steps=5, epochs=1, max_updates=None, n=5,
+                      stochastic=True, state=state)
+    resumed.fit()
+    assert bars[-1].initial == 3 and bars[-1].n == bars[-1].total == 5
+    for a, b in zip(whole.policy.parameters(), resumed.policy.parameters()):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    for run in (whole, first, resumed):
+        run.logger.close()
 
 
 def test_wandb_failure_keeps_local_logging(tmp_path, monkeypatch):

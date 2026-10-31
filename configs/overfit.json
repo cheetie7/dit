@@ -29,7 +29,8 @@
     "max_updates": 24,
     "overfit_one_batch": true,
     "overfit_batches": 24,
-    "objective": "fm"
+    "objective": "fm",
+    "num_steps": null
   },
   "optimizer": {
     "learning_rate": 0.0005,
@@ -57,6 +58,7 @@
   },
   "logging": {
     "use_wandb": false,
-    "log_interval": 1
+    "log_interval": 1,
+    "progress_bar": true
   }
 }

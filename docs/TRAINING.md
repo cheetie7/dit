@@ -33,6 +33,10 @@ outputs/<experiment>-<timestamp>/
 
 Checkpoint 临时写入后原子替换，保留最近 N 个定期文件，不保存 best。恢复全部训练状态及数据位置；AWR 同时恢复 normalizer buffers 和未完成 epoch 的诊断统计。已有 checkpoint 模块名保持兼容。外部数据需保持可访问，换机器时可以覆盖 dataset.root；变更数据内容/划分/统计会拒绝作为同一次实验恢复。
 
+训练预算支持 `training.num_steps`（成功的优化器更新次数）。设为整数时覆盖 num_epochs，scheduler 也使用这个总长度；null 时 `total_steps=ceil(ceil(N/batch_size)/accumulation)*num_epochs`。max_updates 是独立的诊断停止点，恢复时可延后，但保留原 scheduler 总长度。验证与定期 epoch checkpoint 的间隔仍按 epoch，checkpoint.update_interval 支持按优化器更新次数保存。
+
+默认 tqdm 的全局条按成功更新计数、恢复时使用 global_step 初始化；postfix 显示 epoch/loss/LR。验证条按 batch 计数，不影响训练条。logging.progress_bar=false 关闭显示；终端 logging 在进度条间正确换行，文件日志保留完整指标。
+
 每个 epoch 输出原始 Advantage 与权重统计、clip fraction、ESS/ratio、按轨迹权重占比、直方图、散点图与分位数 loss。WandB 是可选依赖，失败时继续本地日志。第一版不使用 WeightedRandomSampler，不计算新的 Advantage，不包含 IQL、STEAM 在线评分或机器人控制。
 
 `configs/overfit.json` 是固定 batch 的 24 次更新诊断；`configs/smoke.json` 是 3 次更新诊断。`configs/fm.json` 与 `awr_fm.json` 是相同模型、划分、seed、batch/LR 的基线对照模板，参数不是最优值声明。更改 objective 请新建实验，不在同一个 checkpoint 上改变研究设置。

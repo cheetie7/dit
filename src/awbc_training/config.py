@@ -21,6 +21,7 @@ class TrainingConfig:
     objective: str = "fm"
     seed: int = 42
     num_epochs: int = 200
+    num_steps: int | None = None  # Optimizer-update budget; overrides num_epochs when set.
     batch_size: int = 16
     num_workers: int = 4
     gradient_accumulation_steps: int = 1
@@ -80,6 +81,7 @@ class LoggingConfig:
     wandb_mode: str = "offline"
     wandb_project: str = "dit-flow-baseline"
     log_interval: int = 10
+    progress_bar: bool = True
 
 
 @dataclass

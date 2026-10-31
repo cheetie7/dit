@@ -25,7 +25,8 @@
     "device": "auto",
     "max_updates": null,
     "overfit_one_batch": false,
-    "objective": "fm"
+    "objective": "fm",
+    "num_steps": null
   },
   "optimizer": {
     "name": "adamw",
@@ -62,7 +63,8 @@
     "use_wandb": false,
     "wandb_mode": "offline",
     "wandb_project": "dit-flow-baseline",
-    "log_interval": 10
+    "log_interval": 10,
+    "progress_bar": true
   },
   "advantage_weighting": {
     "enabled": false,

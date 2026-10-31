@@ -4,6 +4,8 @@ from time import perf_counter
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from awbc_models.euler import synchronize
 from .checkpoint import save_checkpoint
@@ -24,7 +26,10 @@ class Trainer:
         self.optimizer = build_optimizer(self.policy, config.optimizer)
         self.num_batches = math.ceil(len(train_dataset)/config.training.batch_size)
         self.updates_per_epoch = math.ceil(self.num_batches/config.training.gradient_accumulation_steps)
-        self.total_steps = self.updates_per_epoch*config.training.num_epochs
+        self.total_steps = (config.training.num_steps if config.training.num_steps is not None
+                            else self.updates_per_epoch*config.training.num_epochs)
+        if self.total_steps <= 0:
+            raise ValueError("The training update budget must be positive")
         self.scheduler = build_scheduler(self.optimizer, config.scheduler, self.total_steps)
         self.precision = Precision(config.amp, device)
         self.ema = EMA(self.policy, config.ema.decay) if config.ema.enabled else None
@@ -81,7 +86,9 @@ class Trainer:
         sums = {name: 0. for name in policies}
         count = 0
         generator = torch.Generator().manual_seed(self.config.validation.seed)
-        for batch in self.loader(self.val_dataset, validation=True):
+        loader = self.loader(self.val_dataset, validation=True)
+        for batch in tqdm(loader, desc=f"Validation at step {self.global_step}", unit="batch", leave=False,
+                          dynamic_ncols=True, disable=not self.config.logging.progress_bar):
             batch = move_batch(batch, self.device)
             pair = self.training_pair(batch, generator)
             for name, policy in policies.items():
@@ -142,13 +149,19 @@ class Trainer:
                         epoch_number=self.epoch if periodic else None, keep_last_n=config.keep_last_n)
 
     def fit(self):
+        with logging_redirect_tqdm(loggers=[self.logger.logger]), tqdm(
+                total=self.total_steps, initial=self.global_step, desc="Training", unit="update",
+                dynamic_ncols=True, disable=not self.config.logging.progress_bar) as progress:
+            return self._fit(progress)
+
+    def _fit(self, progress):
         config = self.config.training
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
         self.optimizer.zero_grad(set_to_none=True)
         parameters = [p for p in self.policy.parameters() if p.requires_grad]
         last_validation = {}
-        while self.epoch < config.num_epochs:
+        while (self.global_step < self.total_steps if config.num_steps is not None else self.epoch < config.num_epochs):
             if config.max_updates is not None and self.global_step >= config.max_updates:
                 break
             self.policy.train()
@@ -241,12 +254,17 @@ class Trainer:
                     if self.global_step % self.config.logging.log_interval == 0 or not updated:
                         self.logger.log(metrics)
                     self.last_update_metrics = metrics
+                    progress.set_postfix(epoch=self.epoch+1, loss=f"{metrics['train/loss']:.4f}",
+                                         lr=f"{metrics['train/learning_rate']:.2e}", refresh=False)
+                    if updated:
+                        progress.update(1)
                     window_loss = window_samples = window_data_time = window_batch_time = 0
                     window_weighted_sum = window_weight_sum = 0.
                     window_awr_rows = []
                     if self.config.checkpoint.update_interval and updated and self.global_step % self.config.checkpoint.update_interval == 0:
                         self.save()
-                    if config.max_updates is not None and self.global_step >= config.max_updates:
+                    if ((config.max_updates is not None and self.global_step >= config.max_updates)
+                            or (config.num_steps is not None and self.global_step >= self.total_steps)):
                         break
                 end = perf_counter()
             completed = self.batch_in_epoch == len(batches)
@@ -260,7 +278,8 @@ class Trainer:
                                       **summarize_rows(self.epoch_awr_rows, self.weighting.min_weight)})
                 write_analysis(self.epoch_awr_rows, self.directory / "advantage_analysis" / f"epoch_{self.epoch:04d}_step_{self.global_step}",
                                self.weighting.min_weight)
-            stopping = config.max_updates is not None and self.global_step >= config.max_updates
+            stopping = ((config.max_updates is not None and self.global_step >= config.max_updates)
+                        or (config.num_steps is not None and self.global_step >= self.total_steps))
             if self.config.validation.interval and ((self.epoch+1) % self.config.validation.interval == 0 or stopping):
                 last_validation = self.validate()
                 epoch_metrics.update(last_validation)
