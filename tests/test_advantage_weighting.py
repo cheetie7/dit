@@ -14,6 +14,7 @@ from awbc_training.advantage import prepare_advantage_datasets, training_forward
 from awbc_training.advantage_analysis import summarize_rows, write_analysis
 from awbc_training.config import ExperimentConfig, AdvantageWeightingConfig
 from awbc_training.trainer import Trainer
+from test_awbc_data import root
 
 
 class SyntheticWindows(Dataset):
@@ -353,3 +354,70 @@ def test_new_default_horizon_ten_preserves_saved_sixteen_configuration():
     saved["dit"]["action_horizon"] = 16
     restored = FlowMatchingPolicyConfig.from_dict(saved)
     assert restored.dit.action_horizon == 16
+
+
+def write_legacy_export(root):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    labels = []
+    for path in (root/'data').rglob('*.parquet'):
+        rows = pq.read_table(path).to_pylist()
+        for row in rows:
+            start, episode = row['frame_index'], row['episode_index']
+            row.update({'annotation.advantage': -0.02 if episode == 0 else 0.1,
+                        'annotation.advantage_valid': start < 13,
+                        'annotation.action_chunk_start': start in (0, 10),
+                        'annotation.action_chunk_valid_length': 10 if start < 10 else 3})
+        pq.write_table(pa.Table.from_pylist(rows), path)
+    for episode in (0, 1):
+        value = -0.02 if episode == 0 else 0.1
+        for start, length in ((0, 10), (10, 3)):
+            labels.append({'chunk_id': f'ep{episode}_c{start}', 'episode_index': episode,
+                           'relative_start_frame': start, 'relative_end_frame': start+length,
+                           'target_chunk_length': 10, 'advantage': value, 'advantage_valid': True,
+                           'chunks_in_group': 2, 'advantage_divisor': 2,
+                           'progress_start': 0.5, 'progress_end': 0.5+2*value,
+                           'terminal_progress_forced': False})
+    folder = root/'labeling'
+    folder.mkdir()
+    (folder/'summary.json').write_text(json.dumps({'model_path': '/synthetic/Robometer-test-fixture'}))
+    (folder/'chunk_advantages.jsonl').write_text('\n'.join(json.dumps(row) for row in labels)+'\n')
+    return labels
+
+
+def test_existing_robometer_export_needs_no_new_metadata_file(root, caplog):
+    from awbc_training.data import prepare_datasets
+    from awbc_training.config import DatasetConfig
+    from awbc_training.advantage import load_advantage_metadata
+    from awbc_data.images import ImagePreprocessConfig
+    write_legacy_export(root)
+    train, val, _, _ = prepare_datasets(DatasetConfig(root=str(root), stratify_key=None), ImagePreprocessConfig())
+    config = AdvantageWeightingConfig(enabled=True)
+    bound, original_val, weighting, report = prepare_advantage_datasets(train, val, config, 10)
+    assert len(bound) == len(original_val) == 2
+    assert original_val is val and report['coverage']['missing_windows'] == 0
+    assert report['metadata']['source'] == 'robometer'
+    assert report['metadata']['model_version'] is None
+    assert report['metadata']['training_trajectory_ids'] is None
+    assert report['metadata']['provenance_reviewed'] is False
+    assert not report['estimator_training_range_known']
+    assert torch.isfinite(weighting(bound.advantages)).all()
+    assert 'provenance is incomplete' in caplog.text
+    config.metadata_path = str(root/'explicit_missing_metadata.json')
+    with pytest.raises(FileNotFoundError, match='explicit_missing_metadata'):
+        load_advantage_metadata(train.dataset.source, config)
+
+
+@pytest.mark.parametrize('corruption', ['formula', 'parquet'])
+def test_legacy_metadata_loading_rejects_inconsistent_labels(root, corruption):
+    from awbc_training.data import prepare_datasets
+    from awbc_training.config import DatasetConfig
+    from awbc_data.images import ImagePreprocessConfig
+    labels = write_legacy_export(root)
+    labels[0]['advantage'] += 0.1
+    if corruption == 'parquet':
+        labels[0]['progress_end'] += 0.2  # Formula still matches, but annotation values do not.
+    (root/'labeling/chunk_advantages.jsonl').write_text('\n'.join(json.dumps(row) for row in labels)+'\n')
+    train, val, _, _ = prepare_datasets(DatasetConfig(root=str(root), stratify_key=None), ImagePreprocessConfig())
+    with pytest.raises(ValueError, match='formula' if corruption == 'formula' else 'Parquet annotations'):
+        prepare_advantage_datasets(train, val, AdvantageWeightingConfig(enabled=True), 10)

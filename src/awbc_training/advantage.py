@@ -1,5 +1,7 @@
 import hashlib
 import json
+import logging
+import math
 from pathlib import Path
 
 import torch
@@ -21,19 +23,70 @@ def advantage_values(dataset):
     return dataset.advantages
 
 
+def load_advantage_metadata(source, config):
+    """Read an explicit sidecar or the existing, already-scored RoboMeter export."""
+    path = Path(config.metadata_path) if config.metadata_path else source.root / "labeling/advantage_metadata.json"
+    if config.metadata_path or path.is_file():
+        return json.loads(path.read_text()), None
+    summary_path = source.root / "labeling/summary.json"
+    labels_path = source.root / "labeling/chunk_advantages.jsonl"
+    if config.labels_path or not source.has_advantage or not summary_path.is_file() or not labels_path.is_file():
+        raise FileNotFoundError(f"Advantage metadata not found: {path}. Provide advantage_weighting.metadata_path; "
+                                "automatic metadata loading requires an annotated RoboMeter export with summary.json and chunk_advantages.jsonl")
+    summary = json.loads(summary_path.read_text())
+    rows = [json.loads(line) for line in labels_path.read_text().splitlines() if line.strip()]
+    if not rows:
+        raise ValueError("The RoboMeter export contains no chunk labels")
+    for row in rows:
+        divisor = row['advantage_divisor']
+        if divisor not in (1, 2) or divisor != row['chunks_in_group']:
+            raise ValueError(f"Unexpected RoboMeter group definition at {row['chunk_id']}")
+        expected = (row['progress_end']-row['progress_start'])/divisor
+        if not math.isclose(row['advantage'], expected, rel_tol=1e-6, abs_tol=1e-8):
+            raise ValueError(f"Stored advantage does not match the declared progress-increment formula at {row['chunk_id']}")
+        if row.get('terminal_progress_forced') and row['progress_end'] != 1.:
+            raise ValueError(f"Forced terminal progress must be 1 at {row['chunk_id']}")
+    horizons = {row['target_chunk_length'] for row in rows}
+    if len(horizons) != 1:
+        raise ValueError("RoboMeter export mixes different action horizons")
+    metadata = {
+        'source': 'robometer', 'semantics': 'progress_increment_proxy',
+        'model_name': Path(summary['model_path']).name, 'model_path_recorded': summary['model_path'],
+        'model_version': summary.get('model_version'), 'checkpoint_hash': summary.get('checkpoint_hash'),
+        'label_generation_date': summary.get('label_generation_date'),
+        'training_trajectory_ids': summary.get('training_trajectory_ids'),
+        'evaluation_trajectory_ids': sorted({row['episode_index'] for row in rows}),
+        'window_length': horizons.pop(), 'sampling_frequency': source.fps,
+        'advantage_definition': 'Stored advantage=(progress_end-progress_start)/chunks_in_group; '
+                                'paired 10-step chunks share the group delta; singleton tail receives the full delta. '
+                                'Terminal progress is 1 where terminal_progress_forced=true; negatives are retained. '
+                                'Progress-increment proxy, not Q-V.',
+        'metadata_origin': 'labeling/summary.json + labeling/chunk_advantages.jsonl',
+        'provenance_reviewed': False,
+    }
+    return metadata, labels_path
+
+
 def prepare_advantage_datasets(train, val, config, horizon):
     if not config.enabled:
         raise ValueError("awr_fm requires advantage_weighting.enabled=true")
     source = base_dataset(train).source
-    metadata_path = Path(config.metadata_path) if config.metadata_path else source.root / "labeling/advantage_metadata.json"
-    metadata = json.loads(metadata_path.read_text())
-    if not metadata.get("provenance_reviewed") or not metadata.get("model_version"):
-        raise ValueError("Real AWR-FM requires reviewed provenance and an explicit model_version; no labels are fabricated")
+    metadata, exported_labels = load_advantage_metadata(source, config)
+    if not metadata.get('model_version') or metadata.get('training_trajectory_ids') is None:
+        logging.getLogger(__name__).warning('Advantage provenance is incomplete: exact model version or estimator training range '
+                                          'is unknown; preserving unknown fields in advantage_provenance.json')
     provider = (PrecomputedAdvantageProvider.from_file(config.labels_path, metadata) if config.labels_path
                 else PrecomputedAdvantageProvider.from_robometer_dataset(source, metadata))
     full_train, full_val = base_dataset(train), base_dataset(val)
     windows = [sample_metadata(dataset, index, horizon) for dataset in (full_train, full_val) for index in range(len(dataset))]
     coverage = provider.validate_windows(windows, source.fps, config.missing_label_policy)
+    if exported_labels is not None:
+        exported = PrecomputedAdvantageProvider.from_file(exported_labels, metadata)
+        exported.validate_windows(windows, source.fps, config.missing_label_policy)
+        if set(exported.records) != set(provider.records) or any(
+                not math.isclose(row['advantage'], exported.records[key]['advantage'], rel_tol=1e-6, abs_tol=1e-8)
+                for key, row in provider.records.items()):
+            raise ValueError('RoboMeter JSONL labels do not match Parquet annotations')
     fit_records = [provider.get_record(sample_metadata(full_train, index, horizon))
                    for index in range(len(full_train))
                    if (full_train.samples[index][0], full_train.samples[index][1], horizon) in provider.records]

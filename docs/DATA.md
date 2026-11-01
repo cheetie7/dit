@@ -25,4 +25,8 @@ AWR 标签按 `(trajectory_id,start_timestep,action_horizon)` join。end_timeste
 
 已评数据可以从 Parquet annotation 或外部 JSON/JSONL/CSV/Parquet 表读取，不必安装 RoboMeter。原始 reward/progress/quality score 不自动转换成 Advantage。当前 RoboMeter 指标是已有导出流程生成的进度增量 proxy：两块共享边界差分各取一半，单独尾块取完整差分，终点进度强制为 1，负值保留。
 
+来源说明优先使用显式 metadata_path，其次是 labeling/advantage_metadata.json。已核验的旧 RoboMeter 导出只有 summary.json 与 chunk_advantages.jsonl 时，入口支持直接加载：检查表内已存 Advantage 的公式、分组与 horizon，再验证窗口覆盖和 JSONL/Parquet 数值一致性。缺失来源字段保存为 null，输出来源不完整提示并继续使用已经算好的标签；不伪造模型版本、不把 provenance_reviewed 自动设为 true。它不是将任意评分转换成 Advantage 的通用兜底。
+
+2026-11-01 已使用当前真实数据验证：5,252 块完整覆盖，train/val=4,758/494，一个完整块与一个 7 步尾块组成 batch，AWR-FM 前向及 backward 通过，梯度有限且冻结 ResNet 无梯度；未执行 optimizer update。来源记录中的精确模型版本与评分模型训练范围仍未知。
+
 有关来源未知项、实际分布及尾块检查，见 [数据审计](data_audit/README.md)。
