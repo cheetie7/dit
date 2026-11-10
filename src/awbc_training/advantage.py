@@ -7,7 +7,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import Subset
 
-from awbc_data.advantage import AdvantageDataset, PrecomputedAdvantageProvider, sample_metadata
+from awbc_data.advantage import AdvantageDataset, PrecomputedAdvantageProvider, sample_metadata, window_metadata
+from awbc_data.dataset import ROBOMETER_CHUNK_SIZE, action_windows
 from awbc_models.advantage_weighting import AdvantageNormalizer, AdvantageWeighting
 
 
@@ -67,9 +68,37 @@ def load_advantage_metadata(source, config):
     return metadata, labels_path
 
 
+def sum_robometer_labels(provider, windows, horizon):
+    """Combine validated, consecutive base chunks into one label per policy window."""
+    records = []
+    for window in windows:
+        episode = window["trajectory_id"]
+        starts = range(window["start_timestep"], window["end_timestep"], ROBOMETER_CHUNK_SIZE)
+        components = [provider.records.get((episode, start, ROBOMETER_CHUNK_SIZE)) for start in starts]
+        if all(row is not None for row in components):
+            records.append({**window, "advantage": math.fsum(float(row["advantage"]) for row in components)})
+    metadata = {
+        **provider.metadata,
+        "window_length": horizon,
+        "advantage_definition": (
+            "Sum the stored advantages of consecutive 10-step chunks covering real actions in the policy window. "
+            f"Base label: {provider.metadata['advantage_definition']}"
+        ),
+        "aggregation": {
+            "method": "sum",
+            "base_window_length": ROBOMETER_CHUNK_SIZE,
+            "base_provider_fingerprint": provider.fingerprint,
+            "window_stride": horizon,
+        },
+    }
+    return PrecomputedAdvantageProvider(records, metadata)
+
+
 def prepare_advantage_datasets(train, val, config, horizon):
     if not config.enabled:
         raise ValueError("awr_fm requires advantage_weighting.enabled=true")
+    if horizon <= 0 or horizon % ROBOMETER_CHUNK_SIZE:
+        raise ValueError("AWR-FM action_horizon must be a positive multiple of 10")
     source = base_dataset(train).source
     metadata, exported_labels = load_advantage_metadata(source, config)
     if not metadata.get('model_version') or metadata.get('training_trajectory_ids') is None:
@@ -78,15 +107,33 @@ def prepare_advantage_datasets(train, val, config, horizon):
     provider = (PrecomputedAdvantageProvider.from_file(config.labels_path, metadata) if config.labels_path
                 else PrecomputedAdvantageProvider.from_robometer_dataset(source, metadata))
     full_train, full_val = base_dataset(train), base_dataset(val)
+    if any(getattr(dataset, "action_horizon", horizon) != horizon for dataset in (full_train, full_val)):
+        raise ValueError("Dataset window horizon must match the AWR-FM policy horizon")
     windows = [sample_metadata(dataset, index, horizon) for dataset in (full_train, full_val) for index in range(len(dataset))]
-    coverage = provider.validate_windows(windows, source.fps, config.missing_label_policy)
+    base_windows = windows
+    aggregate = metadata["window_length"] != horizon
+    if aggregate:
+        if (metadata["source"], metadata["semantics"], metadata["window_length"]) != (
+            "robometer", "progress_increment_proxy", ROBOMETER_CHUNK_SIZE
+        ):
+            raise ValueError("Label horizon must match policy horizon unless summing 10-step RoboMeter progress-increment labels")
+        base_windows = [
+            window_metadata(episode, start, length)
+            for episode in (*full_train.episode_ids, *full_val.episode_ids)
+            for start, length in action_windows(len(source.rows[episode]["action"]) - 1, ROBOMETER_CHUNK_SIZE)
+        ]
+    coverage = provider.validate_windows(base_windows, source.fps, config.missing_label_policy)
     if exported_labels is not None:
         exported = PrecomputedAdvantageProvider.from_file(exported_labels, metadata)
-        exported.validate_windows(windows, source.fps, config.missing_label_policy)
+        exported.validate_windows(base_windows, source.fps, config.missing_label_policy)
         if set(exported.records) != set(provider.records) or any(
                 not math.isclose(row['advantage'], exported.records[key]['advantage'], rel_tol=1e-6, abs_tol=1e-8)
                 for key, row in provider.records.items()):
             raise ValueError('RoboMeter JSONL labels do not match Parquet annotations')
+    if aggregate:
+        provider = sum_robometer_labels(provider, windows, horizon)
+        coverage = {**provider.validate_windows(windows, source.fps, config.missing_label_policy),
+                    "base": coverage}
     fit_records = [provider.get_record(sample_metadata(full_train, index, horizon))
                    for index in range(len(full_train))
                    if (full_train.samples[index][0], full_train.samples[index][1], horizon) in provider.records]

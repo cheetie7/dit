@@ -5,9 +5,10 @@ import numpy as np
 from torch.utils.data import Subset
 
 from awbc_data import ChunkDataset, DatasetSource
+from awbc_data.dataset import ROBOMETER_CHUNK_SIZE
 
 
-def prepare_datasets(config, image_preprocess):
+def prepare_datasets(config, image_preprocess, *, action_horizon=ROBOMETER_CHUNK_SIZE):
     source = DatasetSource(config.root)
     groups = defaultdict(list)
     for eid in sorted(source.episodes):
@@ -25,8 +26,8 @@ def prepare_datasets(config, image_preprocess):
         else:
             train_ids.extend(ids)  # A singleton condition cannot occur in both sets.
     stats = source.statistics(train_ids)
-    train = ChunkDataset(source, train_ids, stats, image_preprocess=image_preprocess)
-    val = ChunkDataset(source, val_ids, stats, image_preprocess=image_preprocess)
+    train = ChunkDataset(source, train_ids, stats, image_preprocess=image_preprocess, action_horizon=action_horizon)
+    val = ChunkDataset(source, val_ids, stats, image_preprocess=image_preprocess, action_horizon=action_horizon)
     assert not set(train_ids) & set(val_ids)
     for dataset in (train, val):
         for eid, start, length in dataset.samples:
@@ -37,6 +38,8 @@ def prepare_datasets(config, image_preprocess):
                 "statistics_episode_ids": stats["train_episode_ids"],
                 "normalization": "min_max, train trajectories only", "augmentation": "none",
                 "windows_cross_episode": False, "episode_overlap": False}
+    if action_horizon != ROBOMETER_CHUNK_SIZE:
+        manifest["action_horizon"] = action_horizon
     selected = []
     for dataset, limit in ((train, config.max_train_samples), (val, config.max_val_samples)):
         indices = list(range(len(dataset)))

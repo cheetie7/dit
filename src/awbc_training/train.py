@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import Subset
 
 from awbc_models import FlowMatchingPolicy, FlowMatchingPolicyConfig
+from awbc_data.dataset import ROBOMETER_CHUNK_SIZE
 from awbc_data.inspect import tensor_report
 from .config import ExperimentConfig, apply_overrides
 from .data import prepare_datasets
@@ -51,11 +52,15 @@ def main():
     info = json.loads((Path(config.dataset.root) / "meta/info.json").read_text())
     policy_config = (FlowMatchingPolicyConfig.from_dict(state["policy_config"]) if state is not None
                      else config.policy_configuration(info))
-    train, val, stats, manifest = prepare_datasets(config.dataset, policy_config.image_preprocess)
+    horizon = policy_config.dit.action_horizon
+    # Checkpoints made before configurable windows always used 10-step dataset chunks.
+    data_horizon = state["split"].get("action_horizon", ROBOMETER_CHUNK_SIZE) if state is not None else horizon
+    train, val, stats, manifest = prepare_datasets(config.dataset, policy_config.image_preprocess,
+                                                   action_horizon=data_horizon)
     weighting, advantage_report = None, None
     if config.training.objective == "awr_fm":
         train, val, weighting, advantage_report = prepare_advantage_datasets(
-            train, val, config.advantage_weighting, policy_config.dit.action_horizon)
+            train, val, config.advantage_weighting, horizon)
         manifest["advantage_fingerprint"] = advantage_report["fingerprint"]
         manifest["retained_train_samples"] = len(train)
         manifest["retained_val_samples"] = len(val)

@@ -14,8 +14,15 @@ import torch
 from torch.utils.data import Dataset
 
 from .images import IMAGENET_MEAN, IMAGENET_STD, ImagePreprocessConfig, ImagePreprocessor
+
+ROBOMETER_CHUNK_SIZE = 10
 LABELS = ("annotation.advantage", "annotation.advantage_valid",
           "annotation.action_chunk_start", "annotation.action_chunk_valid_length")
+
+
+def action_windows(num_transitions, horizon):
+    for start in range(0, num_transitions, horizon):
+        yield start, min(horizon, num_transitions - start)
 
 
 class DatasetSource:
@@ -75,13 +82,16 @@ class DatasetSource:
 
 
 class ChunkDataset(Dataset):
-    """One observation at t, action[t:t+10]; True in action_is_pad means ignore."""
+    """One observation at each non-overlapping action window's start."""
 
     def __init__(self, source: DatasetSource, episode_ids, stats, image_size=(240, 320),
-                 require_advantage=False, image_preprocess=None):
+                 require_advantage=False, image_preprocess=None, *, action_horizon=ROBOMETER_CHUNK_SIZE):
         self.source = source
         self.episode_ids = tuple(int(e) for e in episode_ids)
         self.stats = stats
+        if action_horizon <= 0:
+            raise ValueError("action_horizon must be positive")
+        self.action_horizon = action_horizon
         self.image_preprocessor = ImagePreprocessor(image_preprocess or ImagePreprocessConfig(size=tuple(image_size)))
         self.image_size = tuple(self.image_preprocessor.config.size)
         if require_advantage and not source.has_advantage:
@@ -89,21 +99,20 @@ class ChunkDataset(Dataset):
         self.samples = []
         for eid in self.episode_ids:
             data = source.rows[eid]
-            n = len(data["index"])
-            starts = np.arange(0, n - 1, 10)
+            num_transitions = len(data["index"]) - 1
             if source.has_advantage:
+                base_windows = list(action_windows(num_transitions, ROBOMETER_CHUNK_SIZE))
                 actual = np.flatnonzero(data[LABELS[2]])
-                if not np.array_equal(actual, starts):
+                if not np.array_equal(actual, [start for start, _ in base_windows]):
                     raise ValueError(f"Annotated starts disagree with 10-step chunks in episode {eid}")
-                for t in starts:
-                    length = min(10, n - 1 - t)
+                for t, length in base_windows:
                     span = slice(t, t + length)
                     if (not data[LABELS[1]][span].all()
                         or not np.all(data[LABELS[3]][span] == length)
                         or not np.isfinite(data[LABELS[0]][span]).all()
                         or not np.all(data[LABELS[0]][span] == data[LABELS[0]][t])):
                         raise ValueError(f"Invalid advantage chunk at episode {eid}, frame {t}")
-            self.samples.extend((eid, int(t), min(10, n - 1 - int(t))) for t in starts)
+            self.samples.extend((eid, start, length) for start, length in action_windows(num_transitions, action_horizon))
         self._containers = OrderedDict()
         self._pid = os.getpid()
 
@@ -161,14 +170,16 @@ class ChunkDataset(Dataset):
         data = self.source.rows[eid]
         decoded = [self._image(eid, t, camera) for camera in self.source.cameras]
         actions = torch.from_numpy(data["action"][t:t + length].copy())
-        actions = torch.cat((actions, actions[-1:].repeat(10 - length, 1)))
+        actions = torch.cat((actions, actions[-1:].repeat(self.action_horizon - length, 1)))
+        # The AWR wrapper supplies the joined label when the window differs from the source chunks.
+        has_native_label = self.source.has_advantage and self.action_horizon == ROBOMETER_CHUNK_SIZE
         return {
             "observation": {"images": torch.stack([x[0] for x in decoded]),
                             "state": self.normalize("observation.state", torch.from_numpy(data["observation.state"][t].copy()))},
             "action": self.normalize("action", actions),
-            "action_is_pad": torch.arange(10) >= length,
-            "advantage": torch.tensor(float(data[LABELS[0]][t]) if self.source.has_advantage else 0, dtype=torch.float32),
-            "advantage_valid": torch.tensor(self.source.has_advantage),
+            "action_is_pad": torch.arange(self.action_horizon) >= length,
+            "advantage": torch.tensor(float(data[LABELS[0]][t]) if has_native_label else 0, dtype=torch.float32),
+            "advantage_valid": torch.tensor(has_native_label),
             "episode_index": torch.tensor(eid), "frame_index": torch.tensor(t),
             "timestamp": torch.tensor(float(data["timestamp"][t]), dtype=torch.float64),
             "video_timestamp": torch.tensor([x[1] for x in decoded], dtype=torch.float64),

@@ -408,8 +408,9 @@ def test_existing_robometer_export_needs_no_new_metadata_file(root, caplog):
         load_advantage_metadata(train.dataset.source, config)
 
 
+@pytest.mark.parametrize('horizon', [10, 20])
 @pytest.mark.parametrize('corruption', ['formula', 'parquet'])
-def test_legacy_metadata_loading_rejects_inconsistent_labels(root, corruption):
+def test_legacy_metadata_loading_rejects_inconsistent_labels(root, corruption, horizon):
     from awbc_training.data import prepare_datasets
     from awbc_training.config import DatasetConfig
     from awbc_data.images import ImagePreprocessConfig
@@ -418,6 +419,65 @@ def test_legacy_metadata_loading_rejects_inconsistent_labels(root, corruption):
     if corruption == 'parquet':
         labels[0]['progress_end'] += 0.2  # Formula still matches, but annotation values do not.
     (root/'labeling/chunk_advantages.jsonl').write_text('\n'.join(json.dumps(row) for row in labels)+'\n')
-    train, val, _, _ = prepare_datasets(DatasetConfig(root=str(root), stratify_key=None), ImagePreprocessConfig())
+    train, val, _, _ = prepare_datasets(DatasetConfig(root=str(root), stratify_key=None), ImagePreprocessConfig(),
+                                       action_horizon=horizon)
     with pytest.raises(ValueError, match='formula' if corruption == 'formula' else 'Parquet annotations'):
-        prepare_advantage_datasets(train, val, AdvantageWeightingConfig(enabled=True), 10)
+        prepare_advantage_datasets(train, val, AdvantageWeightingConfig(enabled=True), horizon)
+
+
+@pytest.mark.parametrize("horizon", [20, 30])
+def test_larger_awr_windows_sum_real_chunks_and_refit_train_stats(root, horizon):
+    from awbc_data.images import ImagePreprocessConfig
+    from awbc_training.config import DatasetConfig
+    from awbc_training.data import prepare_datasets
+
+    labels = write_legacy_export(root)
+    dataset_config = DatasetConfig(root=str(root), stratify_key=None)
+    preprocess = ImagePreprocessConfig(size=(24, 32))
+    config = AdvantageWeightingConfig(enabled=True)
+    base_train, base_val, base_stats, base_manifest = prepare_datasets(dataset_config, preprocess)
+    _, _, _, base_report = prepare_advantage_datasets(base_train, base_val, config, 10)
+    train, val, stats, manifest = prepare_datasets(dataset_config, preprocess, action_horizon=horizon)
+    bound, original_val, weighting, report = prepare_advantage_datasets(train, val, config, horizon)
+
+    assert stats == base_stats and manifest["train_episodes"] == base_manifest["train_episodes"]
+    assert manifest["action_horizon"] == horizon
+    assert len(bound) == len(val) == 1 and original_val is val
+    batch = next(iter(DataLoader(bound, batch_size=1)))
+    episode = batch["trajectory_id"].item()
+    expected = sum(row["advantage"] for row in labels if row["episode_index"] == episode)
+    assert batch["action_horizon"].item() == horizon
+    assert batch["start_timestep"].item() == 0 and batch["end_timestep"].item() == 13
+    assert batch["advantage_valid"].item() and batch["advantage"].item() == pytest.approx(expected)
+    assert batch["action"].shape == (1, horizon, 8)
+    assert batch["action_is_pad"][0].tolist() == [False] * 13 + [True] * (horizon - 13)
+    raw = train.dataset.denormalize("action", batch["action"][0])[:, 0]
+    torch.testing.assert_close(raw, episode * 100 + torch.arange(horizon, dtype=torch.float32).clamp_max(12))
+    assert report["statistics"]["count"] == 1 and report["statistics"]["mean"] == pytest.approx(expected)
+    assert report["coverage"]["base"]["label_count"] == 4 and report["coverage"]["label_count"] == 2
+    assert report["metadata"]["aggregation"]["base_provider_fingerprint"] == base_report["fingerprint"]
+    assert torch.isfinite(weighting(batch["advantage"])).all()
+
+    old_stats = root / "base_advantage_stats.json"
+    old_stats.write_text(json.dumps(base_report["statistics"]))
+    config.statistics_path = str(old_stats)
+    with pytest.raises(ValueError, match="statistics do not belong"):
+        prepare_advantage_datasets(train, val, config, horizon)
+    train.dataset.close()
+
+
+def test_aggregation_uses_each_base_chunk_once_and_never_sums_missing_components():
+    from awbc_training.advantage import sum_robometer_labels
+
+    chunks = [
+        {**window_metadata(0, start, length), "advantage": value}
+        for start, length, value in [(0, 10, 0.5), (10, 10, -0.25), (20, 10, 0.125), (30, 4, -0.5)]
+    ]
+    target = [window_metadata(0, 0, 30, 30), window_metadata(0, 30, 4, 30)]
+    provenance = {**metadata(), "source": "robometer", "semantics": "progress_increment_proxy"}
+    complete = sum_robometer_labels(PrecomputedAdvantageProvider(chunks[::-1], provenance), target, 30)
+    assert [complete.get_advantage(window) for window in target] == [0.375, -0.5]
+    missing = sum_robometer_labels(PrecomputedAdvantageProvider(chunks[1:], provenance), target, 30)
+    assert missing.validate_windows(target, 30, "drop")["missing_windows"] == 1
+    with pytest.raises(ValueError, match="Missing advantage"):
+        missing.validate_windows(target, 30)

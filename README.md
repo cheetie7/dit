@@ -77,6 +77,8 @@ awbc-train --config configs/awr_fm.json \
 
 标注已在 Parquet `annotation.*` 中时不必另传标签表。若使用外部 JSONL/CSV/Parquet 表，增加 `--set advantage_weighting.labels_path=/path/to/chunk_advantages.jsonl`。
 
+使用现有 10 步 RoboMeter 标签训练更长的动作窗口时，给启动命令加上 `--set policy.dit.action_horizon=20`，也可以设置其他正的 10 的倍数。训练和验证都按新 horizon 做无重叠切窗。训练窗口把其中有效的基础块标签相加，再按训练集的合成标签计算归一化统计。尾部 padding 由 mask 屏蔽。更换 horizon 时启动新实验。
+
 现有 RoboMeter 标注导出无需新增或改名文件：当 `labeling/advantage_metadata.json` 不存在时，入口会从已有 `labeling/summary.json` 和 `chunk_advantages.jsonl` 整理来源记录，核验存储标签的进度增量公式及其与 Parquet 标注的一致性。只读取已经算好的 Advantage，不重算标签。模型精确版本、checkpoint hash 或训练范围未知时保存为 null，并输出提示；不会把模型目录名当作精确版本，也不会自动标记来源审查完成。
 
 可通过 `--set advantage_weighting.metadata_path=/path/to/advantage_metadata.json` 显式提供来源文件，格式见 `configs/advantage_metadata.template.json`。显式路径拼写错误会报错，不自动替换；一般的外部标签表仍需要对应来源说明，不将 raw reward/progress 静默当作 Advantage。真实数据检查记录见 [数据审计](docs/data_audit/README.md)。

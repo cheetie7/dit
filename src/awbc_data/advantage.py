@@ -10,8 +10,10 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, Subset
 
+from .dataset import ROBOMETER_CHUNK_SIZE
 
-def window_metadata(episode, start, length, horizon=10):
+
+def window_metadata(episode, start, length, horizon=ROBOMETER_CHUNK_SIZE):
     return {"sample_id": f"ep{episode:06d}_t{start:06d}_h{horizon}", "trajectory_id": int(episode),
             "start_timestep": int(start), "end_timestep": int(start+length), "action_horizon": horizon}
 
@@ -20,7 +22,7 @@ def window_key(record):
     return (record["trajectory_id"], record["start_timestep"], record["action_horizon"])
 
 
-def sample_metadata(dataset, index, horizon=10):
+def sample_metadata(dataset, index, horizon=ROBOMETER_CHUNK_SIZE):
     while isinstance(dataset, Subset):
         index, dataset = dataset.indices[index], dataset.dataset
     episode, start, length = dataset.samples[index]
@@ -94,7 +96,7 @@ class PrecomputedAdvantageProvider(AdvantageProvider):
             raise ValueError("Dataset has no annotation.advantage columns; supply the scored export or a label table")
         rows = []
         for episode, data in source.rows.items():
-            for start in range(0, len(data["action"])-1, 10):
+            for start in range(0, len(data["action"])-1, ROBOMETER_CHUNK_SIZE):
                 if not data["annotation.action_chunk_start"][start] or not data["annotation.advantage_valid"][start]:
                     raise ValueError(f"Invalid annotated chunk at {episode}/{start}")
                 length = int(data["annotation.action_chunk_valid_length"][start])
@@ -135,7 +137,7 @@ class PrecomputedAdvantageProvider(AdvantageProvider):
 
 
 class AdvantageDataset(Dataset):
-    def __init__(self, dataset, provider, horizon=10, missing_policy="error"):
+    def __init__(self, dataset, provider, horizon=ROBOMETER_CHUNK_SIZE, missing_policy="error"):
         self.dataset = dataset
         self.records, self.indices = [], []
         for index in range(len(dataset)):
