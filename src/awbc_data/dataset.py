@@ -20,8 +20,9 @@ LABELS = ("annotation.advantage", "annotation.advantage_valid",
           "annotation.action_chunk_start", "annotation.action_chunk_valid_length")
 
 
-def action_windows(num_transitions, horizon):
-    for start in range(0, num_transitions, horizon):
+def action_windows(num_transitions, horizon, stride=None):
+    step = horizon if stride is None else stride
+    for start in range(0, num_transitions, step):
         yield start, min(horizon, num_transitions - start)
 
 
@@ -82,16 +83,19 @@ class DatasetSource:
 
 
 class ChunkDataset(Dataset):
-    """One observation at each non-overlapping action window's start."""
+    """One observation at each action window's start."""
 
     def __init__(self, source: DatasetSource, episode_ids, stats, image_size=(240, 320),
-                 require_advantage=False, image_preprocess=None, *, action_horizon=ROBOMETER_CHUNK_SIZE):
+                 require_advantage=False, image_preprocess=None, *, action_horizon=ROBOMETER_CHUNK_SIZE, stride=None):
         self.source = source
         self.episode_ids = tuple(int(e) for e in episode_ids)
         self.stats = stats
         if action_horizon <= 0:
             raise ValueError("action_horizon must be positive")
+        if stride is not None and (type(stride) is not int or stride <= 0):
+            raise ValueError("Window stride must be a positive integer")
         self.action_horizon = action_horizon
+        self.stride = action_horizon if stride is None else stride
         self.image_preprocessor = ImagePreprocessor(image_preprocess or ImagePreprocessConfig(size=tuple(image_size)))
         self.image_size = tuple(self.image_preprocessor.config.size)
         if require_advantage and not source.has_advantage:
@@ -112,7 +116,9 @@ class ChunkDataset(Dataset):
                         or not np.isfinite(data[LABELS[0]][span]).all()
                         or not np.all(data[LABELS[0]][span] == data[LABELS[0]][t])):
                         raise ValueError(f"Invalid advantage chunk at episode {eid}, frame {t}")
-            self.samples.extend((eid, start, length) for start, length in action_windows(num_transitions, action_horizon))
+            self.samples.extend(
+                (eid, start, length) for start, length in action_windows(num_transitions, action_horizon, self.stride)
+            )
         self._containers = OrderedDict()
         self._pid = os.getpid()
 

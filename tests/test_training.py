@@ -215,6 +215,28 @@ def test_trajectory_split_train_only_statistics_and_video_alignment(root):
         dataset.close()
 
 
+def test_training_stride_overlaps_windows_without_changing_validation(root):
+    base = DatasetConfig(root=str(root), stratify_key=None)
+    preprocess = ImagePreprocessConfig(size=(12, 16))
+    _, original_val, original_stats, _ = prepare_datasets(base, preprocess)
+    train, val, stats, manifest = prepare_datasets(replace(base, train_stride=1), preprocess)
+    data = train.dataset
+    episode, = data.episode_ids
+    assert data.samples == [(episode, start, min(10, 13 - start)) for start in range(13)]
+    assert manifest["train_stride"] == 1
+    assert val.dataset.samples == original_val.dataset.samples
+    assert stats == original_stats
+
+    sample = train[1]
+    actual = data.denormalize("action", sample["action"])[:, 0]
+    torch.testing.assert_close(actual, episode * 100 + torch.arange(1, 11, dtype=torch.float32))
+    assert sample["frame_index"].item() == 1
+    torch.testing.assert_close(sample["video_timestamp"], sample["video_target_timestamp"])
+    assert not sample["action_is_pad"].any()
+    assert train[-1]["action_is_pad"].tolist() == [False] + [True] * 9
+    data.close()
+
+
 def test_warmup_cosine_update_schedule():
     cfg = ExperimentConfig()
     cfg.scheduler.warmup_steps = 2

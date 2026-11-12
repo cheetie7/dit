@@ -481,3 +481,27 @@ def test_aggregation_uses_each_base_chunk_once_and_never_sums_missing_components
     assert missing.validate_windows(target, 30, "drop")["missing_windows"] == 1
     with pytest.raises(ValueError, match="Missing advantage"):
         missing.validate_windows(target, 30)
+
+
+def test_awr_training_stride_keeps_robometer_labels_aligned(root):
+    from awbc_data.images import ImagePreprocessConfig
+    from awbc_training.config import DatasetConfig
+    from awbc_training.data import prepare_datasets
+
+    labels = write_legacy_export(root)
+    preprocess = ImagePreprocessConfig(size=(24, 32))
+    config = AdvantageWeightingConfig(enabled=True)
+    dataset_config = DatasetConfig(root=str(root), stratify_key=None, train_stride=10)
+    train, val, _, _ = prepare_datasets(dataset_config, preprocess, action_horizon=20)
+    bound, val, _, report = prepare_advantage_datasets(train, val, config, 20)
+    episode, = train.dataset.episode_ids
+    base = [row["advantage"] for row in labels if row["episode_index"] == episode]
+    assert [row["start_timestep"] for row in bound.records] == [0, 10]
+    torch.testing.assert_close(bound.advantages, torch.tensor([sum(base), base[1]]))
+    assert len(val) == 1
+    assert report["metadata"]["aggregation"]["window_stride"] == 10
+    assert report["metadata"]["aggregation"]["validation_window_stride"] == 20
+
+    train, val, _, _ = prepare_datasets(replace(dataset_config, train_stride=1), preprocess, action_horizon=20)
+    with pytest.raises(ValueError, match="train_stride to be a multiple of 10"):
+        prepare_advantage_datasets(train, val, config, 20)

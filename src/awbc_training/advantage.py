@@ -68,7 +68,7 @@ def load_advantage_metadata(source, config):
     return metadata, labels_path
 
 
-def sum_robometer_labels(provider, windows, horizon):
+def sum_robometer_labels(provider, windows, horizon, *, train_stride=None):
     """Combine validated, consecutive base chunks into one label per policy window."""
     records = []
     for window in windows:
@@ -88,9 +88,11 @@ def sum_robometer_labels(provider, windows, horizon):
             "method": "sum",
             "base_window_length": ROBOMETER_CHUNK_SIZE,
             "base_provider_fingerprint": provider.fingerprint,
-            "window_stride": horizon,
+            "window_stride": horizon if train_stride is None else train_stride,
         },
     }
+    if train_stride is not None and train_stride != horizon:
+        metadata["aggregation"]["validation_window_stride"] = horizon
     return PrecomputedAdvantageProvider(records, metadata)
 
 
@@ -99,23 +101,27 @@ def prepare_advantage_datasets(train, val, config, horizon):
         raise ValueError("awr_fm requires advantage_weighting.enabled=true")
     if horizon <= 0 or horizon % ROBOMETER_CHUNK_SIZE:
         raise ValueError("AWR-FM action_horizon must be a positive multiple of 10")
-    source = base_dataset(train).source
+    full_train, full_val = base_dataset(train), base_dataset(val)
+    source = full_train.source
     metadata, exported_labels = load_advantage_metadata(source, config)
+    train_stride = getattr(full_train, "stride", horizon)
+    robometer_base = (metadata["source"], metadata["semantics"], metadata["window_length"]) == (
+        "robometer", "progress_increment_proxy", ROBOMETER_CHUNK_SIZE
+    )
+    if robometer_base and train_stride % ROBOMETER_CHUNK_SIZE:
+        raise ValueError("AWR-FM with 10-step RoboMeter labels requires train_stride to be a multiple of 10")
     if not metadata.get('model_version') or metadata.get('training_trajectory_ids') is None:
         logging.getLogger(__name__).warning('Advantage provenance is incomplete: exact model version or estimator training range '
                                           'is unknown; preserving unknown fields in advantage_provenance.json')
     provider = (PrecomputedAdvantageProvider.from_file(config.labels_path, metadata) if config.labels_path
                 else PrecomputedAdvantageProvider.from_robometer_dataset(source, metadata))
-    full_train, full_val = base_dataset(train), base_dataset(val)
     if any(getattr(dataset, "action_horizon", horizon) != horizon for dataset in (full_train, full_val)):
         raise ValueError("Dataset window horizon must match the AWR-FM policy horizon")
     windows = [sample_metadata(dataset, index, horizon) for dataset in (full_train, full_val) for index in range(len(dataset))]
     base_windows = windows
-    aggregate = metadata["window_length"] != horizon
+    aggregate = metadata["window_length"] != horizon or (robometer_base and train_stride != horizon)
     if aggregate:
-        if (metadata["source"], metadata["semantics"], metadata["window_length"]) != (
-            "robometer", "progress_increment_proxy", ROBOMETER_CHUNK_SIZE
-        ):
+        if not robometer_base:
             raise ValueError("Label horizon must match policy horizon unless summing 10-step RoboMeter progress-increment labels")
         base_windows = [
             window_metadata(episode, start, length)
@@ -131,7 +137,7 @@ def prepare_advantage_datasets(train, val, config, horizon):
                 for key, row in provider.records.items()):
             raise ValueError('RoboMeter JSONL labels do not match Parquet annotations')
     if aggregate:
-        provider = sum_robometer_labels(provider, windows, horizon)
+        provider = sum_robometer_labels(provider, windows, horizon, train_stride=train_stride)
         coverage = {**provider.validate_windows(windows, source.fps, config.missing_label_policy),
                     "base": coverage}
     fit_records = [provider.get_record(sample_metadata(full_train, index, horizon))

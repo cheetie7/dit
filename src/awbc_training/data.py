@@ -26,7 +26,8 @@ def prepare_datasets(config, image_preprocess, *, action_horizon=ROBOMETER_CHUNK
         else:
             train_ids.extend(ids)  # A singleton condition cannot occur in both sets.
     stats = source.statistics(train_ids)
-    train = ChunkDataset(source, train_ids, stats, image_preprocess=image_preprocess, action_horizon=action_horizon)
+    train = ChunkDataset(source, train_ids, stats, image_preprocess=image_preprocess,
+                         action_horizon=action_horizon, stride=config.train_stride)
     val = ChunkDataset(source, val_ids, stats, image_preprocess=image_preprocess, action_horizon=action_horizon)
     assert not set(train_ids) & set(val_ids)
     for dataset in (train, val):
@@ -40,6 +41,8 @@ def prepare_datasets(config, image_preprocess, *, action_horizon=ROBOMETER_CHUNK
                 "windows_cross_episode": False, "episode_overlap": False}
     if action_horizon != ROBOMETER_CHUNK_SIZE:
         manifest["action_horizon"] = action_horizon
+    if train.stride != action_horizon:
+        manifest["train_stride"] = train.stride
     selected = []
     for dataset, limit in ((train, config.max_train_samples), (val, config.max_val_samples)):
         indices = list(range(len(dataset)))

@@ -14,6 +14,7 @@ class DatasetConfig:
     stratify_key: str | None = "tasks"
     max_train_samples: int | None = None
     max_val_samples: int | None = None
+    train_stride: int | None = None  # None uses the action horizon as the training stride.
 
 
 @dataclass

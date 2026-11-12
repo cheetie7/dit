@@ -13,7 +13,8 @@
     "split_seed": 42,
     "stratify_key": "tasks",
     "max_train_samples": null,
-    "max_val_samples": null
+    "max_val_samples": null,
+    "train_stride": null
   },
   "training": {
     "seed": 42,
