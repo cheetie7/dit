@@ -79,7 +79,7 @@ awbc-train --config configs/awr_fm.json \
 
 `dataset.train_stride` 控制训练窗口起点间隔，默认 `null` 时使用动作 horizon。例如纯 FM 用 `--set policy.dit.action_horizon=40 --set dataset.train_stride=1` 每帧取一个 40 步窗口。验证起点间隔使用 horizon。更换 horizon 或 stride 时启动新实验。
 
-使用现有 10 步 RoboMeter 标签训练 AWR-FM 时，horizon 和训练 stride 都须为正的 10 的倍数。训练窗口把其中有效的基础块标签相加，再按训练集的合成标签计算归一化统计。尾部 padding 由 mask 屏蔽。
+现有 10 步 RoboMeter 标签也支持 AWR-FM 每帧取窗。在 `configs/awr_fm.json` 上覆盖 `--set policy.dit.action_horizon=40 --set dataset.train_stride=1` 即可。与基础块边界对齐的配置直接相加原标签。其他配置将每个基础块的标签均分给它的有效动作，再对训练窗口覆盖的有效步求和。Advantage 归一化使用训练窗口统计，尾部 padding 由 mask 屏蔽。
 
 现有 RoboMeter 标注导出无需新增或改名文件：当 `labeling/advantage_metadata.json` 不存在时，入口会从已有 `labeling/summary.json` 和 `chunk_advantages.jsonl` 整理来源记录，核验存储标签的进度增量公式及其与 Parquet 标注的一致性。只读取已经算好的 Advantage，不重算标签。模型精确版本、checkpoint hash 或训练范围未知时保存为 null，并输出提示；不会把模型目录名当作精确版本，也不会自动标记来源审查完成。
 

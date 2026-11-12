@@ -502,6 +502,63 @@ def test_awr_training_stride_keeps_robometer_labels_aligned(root):
     assert report["metadata"]["aggregation"]["window_stride"] == 10
     assert report["metadata"]["aggregation"]["validation_window_stride"] == 20
 
-    train, val, _, _ = prepare_datasets(replace(dataset_config, train_stride=1), preprocess, action_horizon=20)
-    with pytest.raises(ValueError, match="train_stride to be a multiple of 10"):
-        prepare_advantage_datasets(train, val, config, 20)
+
+@pytest.mark.parametrize("horizon", [10, 20, 25])
+def test_dense_awr_stride_uses_step_shares_for_all_valid_starts(root, horizon):
+    from awbc_data.images import ImagePreprocessConfig
+    from awbc_training.config import DatasetConfig
+    from awbc_training.data import prepare_datasets
+
+    labels = write_legacy_export(root)
+    config = DatasetConfig(root=str(root), stratify_key=None, train_stride=1)
+    preprocess = ImagePreprocessConfig(size=(24, 32))
+    train, val, _, _ = prepare_datasets(config, preprocess, action_horizon=horizon)
+    bound, original_val, weighting, report = prepare_advantage_datasets(
+        train, val, AdvantageWeightingConfig(enabled=True), horizon
+    )
+    episode, = train.dataset.episode_ids
+    shares = []
+    for row in labels:
+        if row["episode_index"] == episode:
+            length = row["relative_end_frame"] - row["relative_start_frame"]
+            shares.extend([row["advantage"] / length] * length)
+    expected = [sum(shares[start:start + horizon]) for start in range(13)]
+    assert [row["start_timestep"] for row in bound.records] == list(range(13))
+    torch.testing.assert_close(bound.advantages, torch.tensor(expected))
+    assert original_val is val and val.dataset.stride == horizon
+    assert report["coverage"]["missing_windows"] == 0
+    assert report["statistics"]["mean"] == pytest.approx(sum(expected) / len(expected))
+    assert report["metadata"]["aggregation"]["method"] == "uniform_per_valid_step_sum"
+    assert report["metadata"]["aggregation"]["window_stride"] == 1
+    assert torch.isfinite(weighting(bound.advantages)).all()
+    assert not train[1]["advantage_valid"] and bound[1]["advantage_valid"]
+    tail = bound[-1]
+    assert tail["end_timestep"].item() == 13
+    assert tail["action_is_pad"].tolist() == [False] + [True] * (horizon - 1)
+    train.dataset.close()
+
+
+def test_step_shares_cross_chunk_boundaries_and_reject_uncovered_actions():
+    from awbc_training.advantage import sum_robometer_labels
+
+    chunks = [
+        {**window_metadata(0, start, length), "advantage": value}
+        for start, length, value in [(0, 10, 0.5), (10, 10, -0.25), (20, 4, 0.8)]
+    ]
+    aligned = [window_metadata(0, start, length) for start, length in [(0, 10), (10, 10), (20, 4)]]
+    shifted = [window_metadata(0, start, length) for start, length in [(1, 10), (9, 10), (19, 5), (23, 1)]]
+    targets = aligned + shifted
+    provenance = {**metadata(), "source": "robometer", "semantics": "progress_increment_proxy"}
+    provider = PrecomputedAdvantageProvider(chunks[::-1], provenance)
+    original = sum_robometer_labels(provider, aligned, 10)
+    dense = sum_robometer_labels(provider, targets, 10, train_stride=1, transition_counts={0: 24})
+    assert [dense.get_advantage(row) for row in aligned] == pytest.approx(
+        [original.get_advantage(row) for row in aligned]
+    )
+    assert [dense.get_advantage(row) for row in shifted] == pytest.approx([0.425, -0.175, 0.775, 0.2])
+
+    incomplete = PrecomputedAdvantageProvider([chunks[0], chunks[2]], provenance)
+    dense = sum_robometer_labels(incomplete, targets, 10, train_stride=1, transition_counts={0: 24})
+    assert dense.validate_windows(targets, 30, "drop")["missing_windows"] == 4
+    with pytest.raises(ValueError, match="Missing advantage"):
+        dense.validate_windows(targets, 30)

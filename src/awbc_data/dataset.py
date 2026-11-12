@@ -178,7 +178,9 @@ class ChunkDataset(Dataset):
         actions = torch.from_numpy(data["action"][t:t + length].copy())
         actions = torch.cat((actions, actions[-1:].repeat(self.action_horizon - length, 1)))
         # The AWR wrapper supplies the joined label when the window differs from the source chunks.
-        has_native_label = self.source.has_advantage and self.action_horizon == ROBOMETER_CHUNK_SIZE
+        has_native_label = (
+            self.source.has_advantage and self.action_horizon == ROBOMETER_CHUNK_SIZE and bool(data[LABELS[2]][t])
+        )
         return {
             "observation": {"images": torch.stack([x[0] for x in decoded]),
                             "state": self.normalize("observation.state", torch.from_numpy(data["observation.state"][t].copy()))},

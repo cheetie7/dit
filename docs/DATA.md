@@ -25,7 +25,7 @@ AWR 标签按 `(trajectory_id,start_timestep,action_horizon)` 匹配。`end_time
 
 已评数据可以从 Parquet annotation 或外部 JSON/JSONL/CSV/Parquet 表读取，不必安装 RoboMeter。原始 reward/progress/quality score 不自动转换成 Advantage。当前 RoboMeter 指标是已有导出流程生成的进度增量 proxy：两块共享边界差分各取一半，单独尾块取完整差分，终点进度强制为 1，负值保留。
 
-用 10 步 RoboMeter 进度增量标签训练 `H=20、30、40…` 时，训练 stride 须与标签边界对齐，例如 `10` 或 `20`。先校验基础标签，再把同轨迹窗口内连续基础块的标量相加，每块在单个窗口内取一次。尾窗口只合计实际覆盖的基础块。长窗口可能只覆盖某个评分组的一部分，此时采用原导出中分配给该块的值。合成标签先在训练集上计算归一化统计，再用于 AWR 加权。统计量与合成标签指纹绑定，来源记录包含基础标签指纹、基础块长度和窗口步幅。验证用普通 FM loss。
+用 10 步 RoboMeter 进度增量标签训练 AWR-FM 时，先校验基础标签。horizon 和训练 stride 都对齐 10 步边界时，把窗口覆盖的基础块标量直接相加。其他配置先把每个基础块的标签均分给它的有效动作，再按窗口覆盖的有效步求和。例如尾块实际有 3 步就按标签除以 3，padding 不计入。合成标签先在训练集上计算归一化统计，再作为窗口级 AWR 权重的输入。统计量与合成标签指纹绑定，来源记录包含聚合规则、基础标签指纹、基础块长度和窗口步幅。验证用普通 FM loss。
 
 来源说明优先使用显式 metadata_path，其次是 labeling/advantage_metadata.json。已核验的旧 RoboMeter 导出只有 summary.json 与 chunk_advantages.jsonl 时，入口支持直接加载：检查表内已存 Advantage 的公式、分组与 horizon，再验证窗口覆盖和 JSONL/Parquet 数值一致性。缺失来源字段保存为 null，输出来源不完整提示并继续使用已经算好的标签；不伪造模型版本、不把 provenance_reviewed 自动设为 true。它不是将任意评分转换成 Advantage 的通用兜底。
 

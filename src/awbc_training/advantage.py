@@ -4,6 +4,7 @@ import logging
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import Subset
 
@@ -68,24 +69,53 @@ def load_advantage_metadata(source, config):
     return metadata, labels_path
 
 
-def sum_robometer_labels(provider, windows, horizon, *, train_stride=None):
-    """Combine validated, consecutive base chunks into one label per policy window."""
-    records = []
+def step_robometer_records(provider, windows, transition_counts):
+    """Sum uniformly distributed chunk labels over each window's valid actions."""
+    prefixes = {
+        episode: (np.zeros(count + 1, dtype=np.float64), np.zeros(count + 1, dtype=np.int64))
+        for episode, count in transition_counts.items()
+    }
+    for chunk in provider.records.values():
+        values, labeled = prefixes[chunk["trajectory_id"]]
+        start, end = chunk["start_timestep"], chunk["end_timestep"]
+        values[start + 1:end + 1] = float(chunk["advantage"]) / (end - start)
+        labeled[start + 1:end + 1] = 1
+    for values, labeled in prefixes.values():
+        np.cumsum(values, out=values)
+        np.cumsum(labeled, out=labeled)
+
     for window in windows:
-        episode = window["trajectory_id"]
-        starts = range(window["start_timestep"], window["end_timestep"], ROBOMETER_CHUNK_SIZE)
-        components = [provider.records.get((episode, start, ROBOMETER_CHUNK_SIZE)) for start in starts]
-        if all(row is not None for row in components):
-            records.append({**window, "advantage": math.fsum(float(row["advantage"]) for row in components)})
+        values, labeled = prefixes[window["trajectory_id"]]
+        start, end = window["start_timestep"], window["end_timestep"]
+        if labeled[end] - labeled[start] == end - start:
+            yield {**window, "advantage": float(values[end] - values[start])}
+
+
+def sum_robometer_labels(provider, windows, horizon, *, train_stride=None, transition_counts=None):
+    """Combine validated RoboMeter labels into one scalar per policy window."""
+    if transition_counts is None:
+        records = []
+        for window in windows:
+            episode = window["trajectory_id"]
+            starts = range(window["start_timestep"], window["end_timestep"], ROBOMETER_CHUNK_SIZE)
+            components = [provider.records.get((episode, start, ROBOMETER_CHUNK_SIZE)) for start in starts]
+            if all(row is not None for row in components):
+                records.append({**window, "advantage": math.fsum(float(row["advantage"]) for row in components)})
+        method = "sum"
+        definition = "Sum the stored advantages of consecutive 10-step chunks covering real actions in the policy window. "
+    else:
+        records = step_robometer_records(provider, windows, transition_counts)
+        method = "uniform_per_valid_step_sum"
+        definition = (
+            "Divide each stored chunk advantage by its number of valid actions, then sum the shares "
+            "of the valid actions covered by the policy window. "
+        )
     metadata = {
         **provider.metadata,
         "window_length": horizon,
-        "advantage_definition": (
-            "Sum the stored advantages of consecutive 10-step chunks covering real actions in the policy window. "
-            f"Base label: {provider.metadata['advantage_definition']}"
-        ),
+        "advantage_definition": f"{definition}Base label: {provider.metadata['advantage_definition']}",
         "aggregation": {
-            "method": "sum",
+            "method": method,
             "base_window_length": ROBOMETER_CHUNK_SIZE,
             "base_provider_fingerprint": provider.fingerprint,
             "window_stride": horizon if train_stride is None else train_stride,
@@ -99,8 +129,8 @@ def sum_robometer_labels(provider, windows, horizon, *, train_stride=None):
 def prepare_advantage_datasets(train, val, config, horizon):
     if not config.enabled:
         raise ValueError("awr_fm requires advantage_weighting.enabled=true")
-    if horizon <= 0 or horizon % ROBOMETER_CHUNK_SIZE:
-        raise ValueError("AWR-FM action_horizon must be a positive multiple of 10")
+    if horizon <= 0:
+        raise ValueError("AWR-FM action_horizon must be positive")
     full_train, full_val = base_dataset(train), base_dataset(val)
     source = full_train.source
     metadata, exported_labels = load_advantage_metadata(source, config)
@@ -108,8 +138,8 @@ def prepare_advantage_datasets(train, val, config, horizon):
     robometer_base = (metadata["source"], metadata["semantics"], metadata["window_length"]) == (
         "robometer", "progress_increment_proxy", ROBOMETER_CHUNK_SIZE
     )
-    if robometer_base and train_stride % ROBOMETER_CHUNK_SIZE:
-        raise ValueError("AWR-FM with 10-step RoboMeter labels requires train_stride to be a multiple of 10")
+    if not robometer_base and horizon % ROBOMETER_CHUNK_SIZE:
+        raise ValueError("AWR-FM action_horizon must be a multiple of 10 unless using RoboMeter step aggregation")
     if not metadata.get('model_version') or metadata.get('training_trajectory_ids') is None:
         logging.getLogger(__name__).warning('Advantage provenance is incomplete: exact model version or estimator training range '
                                           'is unknown; preserving unknown fields in advantage_provenance.json')
@@ -120,13 +150,18 @@ def prepare_advantage_datasets(train, val, config, horizon):
     windows = [sample_metadata(dataset, index, horizon) for dataset in (full_train, full_val) for index in range(len(dataset))]
     base_windows = windows
     aggregate = metadata["window_length"] != horizon or (robometer_base and train_stride != horizon)
+    step_aggregation = horizon % ROBOMETER_CHUNK_SIZE != 0 or train_stride % ROBOMETER_CHUNK_SIZE != 0
     if aggregate:
         if not robometer_base:
             raise ValueError("Label horizon must match policy horizon unless summing 10-step RoboMeter progress-increment labels")
+        transition_counts = {
+            episode: len(source.rows[episode]["action"]) - 1
+            for episode in (*full_train.episode_ids, *full_val.episode_ids)
+        }
         base_windows = [
             window_metadata(episode, start, length)
-            for episode in (*full_train.episode_ids, *full_val.episode_ids)
-            for start, length in action_windows(len(source.rows[episode]["action"]) - 1, ROBOMETER_CHUNK_SIZE)
+            for episode, count in transition_counts.items()
+            for start, length in action_windows(count, ROBOMETER_CHUNK_SIZE)
         ]
     coverage = provider.validate_windows(base_windows, source.fps, config.missing_label_policy)
     if exported_labels is not None:
@@ -137,7 +172,10 @@ def prepare_advantage_datasets(train, val, config, horizon):
                 for key, row in provider.records.items()):
             raise ValueError('RoboMeter JSONL labels do not match Parquet annotations')
     if aggregate:
-        provider = sum_robometer_labels(provider, windows, horizon, train_stride=train_stride)
+        provider = sum_robometer_labels(
+            provider, windows, horizon, train_stride=train_stride,
+            transition_counts=transition_counts if step_aggregation else None,
+        )
         coverage = {**provider.validate_windows(windows, source.fps, config.missing_label_policy),
                     "base": coverage}
     fit_records = [provider.get_record(sample_metadata(full_train, index, horizon))
