@@ -11,7 +11,9 @@ from torch.utils.data import Subset
 
 from awbc_data.advantage import AdvantageDataset, PrecomputedAdvantageProvider, sample_metadata, window_key, window_metadata
 from awbc_data.dataset import ROBOMETER_CHUNK_SIZE, action_windows
+from awbc_data.iql_dense import load_progress
 from awbc_models.advantage_weighting import AdvantageNormalizer, AdvantageWeighting
+from awbc_models.dense_awbc_weighting import DenseAWBCWeighting
 
 
 def base_dataset(dataset):
@@ -189,13 +191,7 @@ def prepare_advantage_datasets(train, val, config, horizon):
 
 
 def fit_weighting(provider, fit_records, train_ids, config):
-    if not fit_records:
-        raise ValueError("No labeled training windows remain after the missing-label policy")
-    values = torch.tensor([row["advantage"] for row in fit_records], dtype=torch.float64)
-    ids = sorted(row["sample_id"] for row in fit_records)
-    stats = {"mean": values.mean().item(), "std": values.std(correction=0).item(), "count": len(values),
-             "training_trajectory_ids": list(train_ids), "provider_fingerprint": provider.fingerprint,
-             "sample_ids_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest()}
+    stats = advantage_statistics(provider, fit_records, train_ids)
     if config.statistics_path:
         loaded = json.loads(Path(config.statistics_path).read_text())
         if loaded["provider_fingerprint"] != provider.fingerprint or set(loaded["training_trajectory_ids"]) != set(train_ids):
@@ -206,15 +202,27 @@ def fit_weighting(provider, fit_records, train_ids, config):
     return weighting, stats
 
 
-def prepare_iql_advantage_dataset(train, config, horizon, split):
+def advantage_statistics(provider, fit_records, train_ids):
+    if not fit_records:
+        raise ValueError("No labeled training windows remain after the missing-label policy")
+    values = torch.tensor([row["advantage"] for row in fit_records], dtype=torch.float64)
+    ids = sorted(row["sample_id"] for row in fit_records)
+    return {"mean": values.mean().item(), "std": values.std(correction=0).item(), "count": len(values),
+            "training_trajectory_ids": list(train_ids), "provider_fingerprint": provider.fingerprint,
+            "sample_ids_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest()}
+
+
+def join_iql_advantages(train, config, horizon, split, *, require_dense=False):
     """Join the critic's exact training-window export to the policy training subset."""
     if not config.enabled or not config.labels_path or not config.metadata_path:
-        raise ValueError("iql_fm requires advantage_weighting.enabled, labels_path and metadata_path")
+        raise ValueError("IQL policy weighting requires advantage_weighting.enabled, labels_path and metadata_path")
     if config.missing_label_policy != "error" or not config.detach_weights:
-        raise ValueError("iql_fm requires complete labels and detached weights")
+        raise ValueError("IQL policy weighting requires complete labels and detached weights")
     full_train = base_dataset(train)
     export = json.loads(Path(config.metadata_path).read_text())
     contract = export["data_contract"]
+    if require_dense and contract.get("reward_mode") != "dense":
+        raise ValueError("iql_dense_awbc requires an Advantage export from a dense IQL critic")
     checkpoint = export["checkpoint"]
     for key, expected in (("action_horizon", horizon), ("train_stride", full_train.stride)):
         if contract[key] != expected:
@@ -242,10 +250,28 @@ def prepare_iql_advantage_dataset(train, config, horizon, split):
     if export["record_count"] != coverage["label_count"]:
         raise ValueError("IQL label count differs from the critic export metadata")
     dataset = AdvantageDataset(train, provider, horizon)
-    weighting, stats = fit_weighting(provider, dataset.records, full_train.episode_ids, config)
     report = {**provider.provenance_report(split["train_episodes"], split["val_episodes"]),
-              "coverage": coverage, "statistics": stats, "normalization_mode": config.normalization,
-              "critic_checkpoint": checkpoint, "weight_configuration": asdict(config)}
+              "coverage": coverage, "critic_checkpoint": checkpoint}
+    return dataset, provider, report
+
+
+def prepare_iql_advantage_dataset(train, config, horizon, split):
+    dataset, provider, report = join_iql_advantages(train, config, horizon, split)
+    weighting, stats = fit_weighting(provider, dataset.records, split["train_episodes"], config)
+    report.update(statistics=stats, normalization_mode=config.normalization, weight_configuration=asdict(config))
+    return dataset, weighting, report
+
+
+def prepare_dense_awbc_dataset(train, labels, config, horizon, split):
+    dataset, provider, report = join_iql_advantages(train, labels, horizon, split, require_dense=True)
+    if not config.progress_path:
+        raise ValueError("iql_dense_awbc requires dense_awbc.progress_path")
+    potentials, progress_sha256 = load_progress(config.progress_path, base_dataset(train).source)
+    deltas = [potentials[row["trajectory_id"]][row["end_timestep"]]
+              - potentials[row["trajectory_id"]][row["start_timestep"]] for row in dataset.records]
+    weighting = DenseAWBCWeighting([row["advantage"] for row in dataset.records], deltas, config)
+    report.update(statistics=advantage_statistics(provider, dataset.records, split["train_episodes"]),
+                  normalization_mode="none", weight_configuration=asdict(config), progress_sha256=progress_sha256)
     return dataset, weighting, report
 
 

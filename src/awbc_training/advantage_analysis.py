@@ -5,6 +5,10 @@ from pathlib import Path
 import numpy as np
 
 
+DENSE_WEIGHT_METRICS = ("robometer/scale", "robometer/above_threshold_fraction",
+                        "weight/normalized_p10", "weight/normalized_p50", "weight/normalized_p90")
+
+
 def summarize_rows(rows, min_weight=None):
     advantage = np.asarray([r["advantage"] for r in rows])
     weight = np.asarray([r["weight"] for r in rows])
@@ -23,6 +27,10 @@ def summarize_rows(rows, min_weight=None):
         "largest_trajectory_mass_fraction": max(mass.values())/weight.sum()}.items()})
     if min_weight is not None:
         result["weight/minimum_fraction"] = float(np.isclose(weight, min_weight).mean())
+    if "above_threshold" in rows[0]:
+        result["robometer/above_threshold_fraction"] = float(np.mean([r["above_threshold"] for r in rows]))
+        for q, value in zip((10, 50, 90), np.percentile(weight, (10, 50, 90))):
+            result[f"weight/normalized_p{q}"] = float(value)
     result["weight/trajectory_mass_fraction"] = {key: value/weight.sum() for key, value in mass.items()}
     return result
 

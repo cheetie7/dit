@@ -6,7 +6,8 @@ from pathlib import Path
 from awbc_models import FlowMatchingPolicyConfig
 
 
-WEIGHTED_OBJECTIVES = ("awr_fm", "iql_fm")
+IQL_OBJECTIVES = ("iql_fm", "iql_dense_awbc")
+WEIGHTED_OBJECTIVES = ("awr_fm", *IQL_OBJECTIVES)
 
 
 @dataclass
@@ -104,6 +105,17 @@ class AdvantageWeightingConfig:
 
 
 @dataclass
+class DenseAWBCConfig:
+    progress_path: str | None = None
+    beta_q: float = 1.0
+    critic_weight_cap: float = 10.0
+    robometer_threshold: float = 0.01
+    robometer_scale_start: float = 1.0
+    robometer_decay_enabled: bool = False
+    robometer_decay_steps: int = 0
+
+
+@dataclass
 class ExperimentConfig:
     experiment_name: str = "flow_matching_baseline"
     output_root: str = "outputs"
@@ -119,13 +131,14 @@ class ExperimentConfig:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     advantage_weighting: AdvantageWeightingConfig = field(default_factory=AdvantageWeightingConfig)
+    dense_awbc: DenseAWBCConfig = field(default_factory=DenseAWBCConfig)
 
     @classmethod
     def from_dict(cls, value):
         sections = {"dataset": DatasetConfig, "training": TrainingConfig, "optimizer": OptimizerConfig,
                     "scheduler": SchedulerConfig, "amp": AMPConfig, "ema": EMAConfig,
                     "validation": ValidationConfig, "checkpoint": CheckpointConfig, "logging": LoggingConfig,
-                    "advantage_weighting": AdvantageWeightingConfig}
+                    "advantage_weighting": AdvantageWeightingConfig, "dense_awbc": DenseAWBCConfig}
         return cls(**{key: sections[key](**item) if key in sections else item for key, item in value.items()})
 
     @classmethod

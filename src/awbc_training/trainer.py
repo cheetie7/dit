@@ -3,19 +3,20 @@ import math
 from time import perf_counter
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from awbc_models.euler import synchronize
+from awbc_models.dense_awbc_weighting import DenseAWBCWeighting
 from .checkpoint import save_checkpoint
-from .config import WEIGHTED_OBJECTIVES
+from .config import IQL_OBJECTIVES, WEIGHTED_OBJECTIVES
 from .ema import EMA
 from .logging import ExperimentLogger
 from .optim import build_optimizer, build_scheduler, optimizer_summary
 from .runtime import Precision, move_batch, restore_rng, rng_state
 from .advantage import advantage_values, training_forward
-from .advantage_analysis import summarize_rows, write_analysis
+from .advantage_analysis import DENSE_WEIGHT_METRICS, summarize_rows, write_analysis
 
 
 class Trainer:
@@ -42,17 +43,27 @@ class Trainer:
         self.last_validation = {}
         objective = config.training.objective
         if objective not in ("fm", *WEIGHTED_OBJECTIVES):
-            raise ValueError("training.objective must be fm, awr_fm or iql_fm")
+            raise ValueError(f"training.objective must be one of {('fm', *WEIGHTED_OBJECTIVES)}")
         weighted = objective in WEIGHTED_OBJECTIVES
         self.weighting = weighting.to(device) if weighting is not None and weighted else None
         if weighted and self.weighting is None:
             raise ValueError(f"{objective} requires aligned labels and an AdvantageWeighting module")
-        self.dataset_weights = self.weighting(advantage_values(train_dataset).to(device)).detach().cpu() if self.weighting else None
+        self.dense_weighting = self.weighting if isinstance(self.weighting, DenseAWBCWeighting) else None
+        self.dataset_weights = None
+        if self.dense_weighting:
+            indices = torch.arange(len(train_dataset))
+            while isinstance(train_dataset, Subset):
+                indices = torch.as_tensor(train_dataset.indices, dtype=torch.long)[indices]
+                train_dataset = train_dataset.dataset
+            self.dense_indices = indices
+        elif self.weighting:
+            self.dataset_weights = self.weighting(advantage_values(train_dataset).to(device)).detach().cpu()
         self.epoch_awr_rows = []
         self.epoch_weighted_sum = self.epoch_weight_sum = 0.
         if resume_state is not None:
             self.load_state(resume_state)
-        self.logger = ExperimentLogger(directory, config, resume=resume_state is not None)
+        self.logger = ExperimentLogger(directory, config, resume=resume_state is not None,
+                                       extra_columns=DENSE_WEIGHT_METRICS if self.dense_weighting else ())
         self.summary = optimizer_summary(self.policy, self.optimizer)
         self.logger.logger.info("Parameters and optimizer: %s", self.summary)
         self.logger.logger.info("Device=%s AMP=%s scaler=%s planned updates=%s", device,
@@ -130,12 +141,17 @@ class Trainer:
         objective = self.config.training.objective
         if original.get("objective", "fm") != objective:
             raise ValueError("Resume cannot change the training objective; start a separate comparison run")
-        if objective == "iql_fm":
+        if objective in IQL_OBJECTIVES:
             for key, description in (("iql_critic_checkpoint", "critic checkpoint"),
                                      ("advantage_fingerprint", "label fingerprint"),
                                      ("iql_advantage_statistics", "normalization statistics")):
                 if state["split"][key] != self.manifest[key]:
                     raise ValueError(f"Resume IQL Advantage {description} differs from the checkpoint")
+        if objective == "iql_dense_awbc":
+            if state["split"]["robometer_progress_sha256"] != self.manifest["robometer_progress_sha256"]:
+                raise ValueError("Resume RoboMeter progress fingerprint differs from the checkpoint")
+            if state["config"]["dense_awbc"] != asdict(self.config.dense_awbc):
+                raise ValueError("Resume must retain the original Dense AWBC weight configuration")
         if state["normalization_stats"] != self.stats or state["split"] != self.manifest:
             raise ValueError("Resume dataset split/statistics differ from the checkpoint")
         if state["total_steps"] != self.total_steps:
@@ -205,13 +221,18 @@ class Trainer:
                 window_start = index//config.gradient_accumulation_steps*config.gradient_accumulation_steps
                 window_end = min(window_start+config.gradient_accumulation_steps, len(batches))
                 window_count = sum(len(indices) for indices in batches[window_start:window_end])
+                if self.dense_weighting and index == window_start:
+                    indices = [item for batch_indices in batches[window_start:window_end] for item in batch_indices]
+                    dense_indices = self.dense_indices[indices]
+                    robometer_scale = self.dense_weighting.robometer_scale(self.global_step)
+                    dense_weights = self.dense_weighting.normalized_weights(dense_indices, robometer_scale)
                 pair = {}
                 if config.overfit_one_batch:
                     if self.fixed_pair is None:
                         self.fixed_pair = self.training_pair(batch, torch.Generator().manual_seed(config.seed+9999))
                     pair = self.fixed_pair
                 with self.precision.autocast():
-                    output = training_forward(self.policy, batch, self.weighting, **pair)
+                    output = training_forward(self.policy, batch, None if self.dense_weighting else self.weighting, **pair)
                     loss = output["loss"]
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Nonfinite training loss at update {self.global_step}")
@@ -221,15 +242,29 @@ class Trainer:
                     weight_mass = count
                     weighted_sum = output["per_sample_loss"].detach().sum().item()
                 else:
-                    window_indices = [item for indices in batches[window_start:window_end] for item in indices]
-                    total_mass = self.dataset_weights[window_indices].sum().item()
-                    weight_mass = output["sample_weight"].sum().item()
-                    scaled_loss = loss*weight_mass/total_mass
-                    weighted_sum = (output["sample_weight"]*output["per_sample_loss"].detach()).sum().item()
+                    if self.dense_weighting:
+                        offset = (index - window_start) * config.batch_size
+                        selection = slice(offset, offset + count)
+                        sample_weights = dense_weights[selection]
+                        sources = dense_indices[selection]
+                        clipped = self.dense_weighting.critic_clipped[sources].tolist()
+                        weight_mass = sample_weights.sum().item()
+                        scaled_loss = (sample_weights.to(output["per_sample_loss"]) * output["per_sample_loss"]).sum()
+                        weighted_sum = scaled_loss.detach().item()
+                    else:
+                        window_indices = [item for indices in batches[window_start:window_end] for item in indices]
+                        total_mass = self.dataset_weights[window_indices].sum().item()
+                        sample_weights = output["sample_weight"]
+                        clipped = self.weighting.clip_flags(batch["advantage"]).tolist()
+                        weight_mass = sample_weights.sum().item()
+                        scaled_loss = loss*weight_mass/total_mass
+                        weighted_sum = (sample_weights * output["per_sample_loss"].detach()).sum().item()
                     rows = [{"trajectory_id": int(e), "advantage": float(a), "weight": float(w), "loss": float(l), "clipped": bool(c)}
                             for e, a, w, l, c in zip(batch["trajectory_id"].tolist(), batch["advantage"].tolist(),
-                                                   output["sample_weight"].tolist(), output["per_sample_loss"].detach().tolist(),
-                                                   self.weighting.clip_flags(batch["advantage"]).tolist())]
+                                                   sample_weights.tolist(), output["per_sample_loss"].detach().tolist(), clipped)]
+                    if self.dense_weighting:
+                        for row, above in zip(rows, self.dense_weighting.above_threshold[sources].tolist()):
+                            row["above_threshold"] = above
                     self.epoch_awr_rows.extend(rows)
                     window_awr_rows.extend(rows)
                 self.precision.scaler.scale(scaled_loss).backward()
@@ -277,6 +312,8 @@ class Trainer:
                         metrics.update({"train/unweighted_loss": window_loss/window_samples,
                                         "train/weighted_loss": window_weighted_sum/window_weight_sum,
                                         **summarize_rows(window_awr_rows, self.weighting.min_weight)})
+                    if self.dense_weighting:
+                        metrics["robometer/scale"] = robometer_scale
                     if self.global_step % self.config.logging.log_interval == 0 or not updated:
                         self.logger.log(metrics)
                     self.last_update_metrics = metrics

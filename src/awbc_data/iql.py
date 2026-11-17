@@ -66,6 +66,10 @@ class RLChunkDataset(Dataset):
     def __len__(self):
         return len(self.dataset)
 
+    @property
+    def policy_dataset(self):
+        return self.dataset
+
     def __getitem__(self, index):
         sample = self.dataset[index]
         episode = sample["episode_index"].item()

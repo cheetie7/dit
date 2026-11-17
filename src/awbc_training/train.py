@@ -1,4 +1,4 @@
-"""Train an FM, AWR-FM or IQL-FM policy from JSON configuration and CLI overrides."""
+"""Train a flow-matching policy from JSON configuration and CLI overrides."""
 import argparse
 from copy import deepcopy
 from dataclasses import asdict
@@ -16,11 +16,11 @@ from torch.utils.data import Subset
 from awbc_models import FlowMatchingPolicy, FlowMatchingPolicyConfig
 from awbc_data.dataset import ROBOMETER_CHUNK_SIZE
 from awbc_data.inspect import tensor_report
-from .config import ExperimentConfig, WEIGHTED_OBJECTIVES, apply_overrides
+from .config import ExperimentConfig, IQL_OBJECTIVES, WEIGHTED_OBJECTIVES, apply_overrides
 from .data import prepare_datasets
 from .runtime import resolve_device, seed_everything
 from .trainer import Trainer
-from .advantage import prepare_advantage_datasets, prepare_iql_advantage_dataset
+from .advantage import prepare_advantage_datasets, prepare_dense_awbc_dataset, prepare_iql_advantage_dataset
 
 
 def timestamp():
@@ -55,10 +55,10 @@ def main():
                      else config.policy_configuration(info))
     horizon = policy_config.dit.action_horizon
     objective = config.training.objective
-    if state is not None and objective == "iql_fm":
+    if state is not None and objective in IQL_OBJECTIVES:
         requested = config.policy.get("dit", {}).get("action_horizon", horizon)
         if requested != horizon:
-            raise ValueError(f"IQL-FM resume action_horizon={requested} differs from checkpoint action_horizon={horizon}; "
+            raise ValueError(f"{objective} resume action_horizon={requested} differs from checkpoint action_horizon={horizon}; "
                              "re-export labels and start a new run for the requested horizon")
     # Checkpoints made before configurable windows always used 10-step dataset chunks.
     data_horizon = state["split"].get("action_horizon", ROBOMETER_CHUNK_SIZE) if state is not None else horizon
@@ -68,8 +68,10 @@ def main():
     if objective == "iql_fm":
         train, weighting, advantage_report = prepare_iql_advantage_dataset(
             train, config.advantage_weighting, horizon, manifest)
-        manifest["iql_critic_checkpoint"] = advantage_report["critic_checkpoint"]
-        manifest["iql_advantage_statistics"] = advantage_report["statistics"]
+    elif objective == "iql_dense_awbc":
+        train, weighting, advantage_report = prepare_dense_awbc_dataset(
+            train, config.advantage_weighting, config.dense_awbc, horizon, manifest)
+        manifest["robometer_progress_sha256"] = advantage_report["progress_sha256"]
     elif objective == "awr_fm":
         train, val, weighting, advantage_report = prepare_advantage_datasets(
             train, val, config.advantage_weighting, horizon)
@@ -77,6 +79,9 @@ def main():
         manifest["advantage_fingerprint"] = advantage_report["fingerprint"]
         manifest["retained_train_samples"] = len(train)
         manifest["retained_val_samples"] = len(val)
+    if objective in IQL_OBJECTIVES:
+        manifest["iql_critic_checkpoint"] = advantage_report["critic_checkpoint"]
+        manifest["iql_advantage_statistics"] = advantage_report["statistics"]
     if config.training.overfit_one_batch:
         count = min(config.training.batch_size, len(train))
         train = Subset(train, list(range(count))*config.training.overfit_batches)

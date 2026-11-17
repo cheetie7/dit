@@ -1,0 +1,88 @@
+{
+  "experiment_name": "iql_dense_awbc_h10",
+  "output_root": "outputs",
+  "policy_config": null,
+  "policy": {
+    "dit": {
+      "action_horizon": 10
+    }
+  },
+  "dataset": {
+    "root": "data/block_insertion_rgb_640x480_300_iql",
+    "val_fraction": 0.1,
+    "split_seed": 42,
+    "stratify_key": "tasks",
+    "max_train_samples": null,
+    "max_val_samples": null,
+    "train_stride": null
+  },
+  "training": {
+    "seed": 42,
+    "num_epochs": 200,
+    "num_steps": null,
+    "batch_size": 16,
+    "num_workers": 4,
+    "gradient_accumulation_steps": 1,
+    "gradient_clip_norm": 1.0,
+    "device": "auto",
+    "max_updates": null,
+    "overfit_one_batch": false,
+    "objective": "iql_dense_awbc"
+  },
+  "optimizer": {
+    "name": "adamw",
+    "learning_rate": 0.0001,
+    "backbone_learning_rate": 1e-05,
+    "weight_decay": 0.0001,
+    "no_decay_bias_and_norm": true
+  },
+  "scheduler": {
+    "name": "cosine",
+    "warmup_steps": 500,
+    "min_lr_ratio": 0.01
+  },
+  "amp": {
+    "enabled": true,
+    "dtype": "bfloat16"
+  },
+  "ema": {
+    "enabled": true,
+    "decay": 0.999
+  },
+  "validation": {
+    "interval": 0,
+    "batch_size": 16,
+    "seed": 1234,
+    "use_ema": true,
+    "update_interval": 1000
+  },
+  "checkpoint": {
+    "save_interval": 0,
+    "keep_last_n": 3,
+    "update_interval": 5000
+  },
+  "logging": {
+    "use_wandb": false,
+    "wandb_mode": "offline",
+    "wandb_project": "dit-flow-iql-dense-awbc",
+    "log_interval": 10,
+    "progress_bar": true
+  },
+  "advantage_weighting": {
+    "enabled": true,
+    "normalization": "none",
+    "detach_weights": true,
+    "labels_path": "data/iql_dense_critic/advantages.jsonl",
+    "metadata_path": "data/iql_dense_critic/advantages.metadata.json",
+    "missing_label_policy": "error"
+  },
+  "dense_awbc": {
+    "progress_path": "data/block_insertion_rgb_640x480_300_iql/boundary_progress_iql.jsonl",
+    "beta_q": 1.0,
+    "critic_weight_cap": 10.0,
+    "robometer_threshold": 0.01,
+    "robometer_scale_start": 1.0,
+    "robometer_decay_enabled": false,
+    "robometer_decay_steps": 0
+  }
+}

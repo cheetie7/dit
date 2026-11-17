@@ -7,6 +7,7 @@ from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import torch
 from torch.utils.data import DataLoader
@@ -24,10 +25,12 @@ from .runtime import move_batch, resolve_device, restore_rng, rng_state, seed_ev
 
 COUNT_METRICS = ("nonzero_reward_windows", "terminated_windows", "truncated_windows")
 MEAN_METRICS = ("q_loss", "v_loss", "q1_mean", "q2_mean", "v_mean", "td_target_mean", "q_abs_diff")
+DENSE_REWARD_FIELDS = ("reward_sparse", "reward_dense", "reward")
 
 
 @dataclass
 class IQLConfig:
+    reward_mode: ClassVar[str] = "sparse"
     labels_path: str
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     image_preprocess: ImagePreprocessConfig = field(default_factory=ImagePreprocessConfig)
@@ -66,6 +69,9 @@ class IQLConfig:
             raise ValueError("num_steps and batch_size must be positive")
         return config
 
+    def prepare_rewards(self, train, val):
+        return train, val, {}
+
 
 def expectile_loss(residual, expectile):
     return (torch.where(residual > 0, expectile, 1 - expectile) * residual.square()).mean()
@@ -82,6 +88,8 @@ def td_target(batch, next_value):
 
 
 def _metrics(batch, value, q1, q2, target, v_loss, q_loss):
+    reward_means = ({f"{key}_mean": batch[key].mean().item() for key in DENSE_REWARD_FIELDS}
+                    if "reward_dense" in batch else {})
     return dict(
         v_loss=v_loss.item(), q_loss=q_loss.item(), v_mean=value.mean().item(),
         q1_mean=q1.mean().item(), q2_mean=q2.mean().item(),
@@ -89,17 +97,18 @@ def _metrics(batch, value, q1, q2, target, v_loss, q_loss):
         nonzero_reward_windows=int(batch["reward"].count_nonzero()),
         terminated_windows=int(batch["terminated"].count_nonzero()),
         truncated_windows=int(batch["truncated"].count_nonzero()),
+        **reward_means,
     )
 
 
 class _MetricTotals:
     def __init__(self):
-        self.totals = dict.fromkeys((*MEAN_METRICS, *COUNT_METRICS), 0)
+        self.totals = {}
         self.size = 0
 
     def add(self, metrics, size):
         for key, metric in metrics.items():
-            self.totals[key] += metric if key in COUNT_METRICS else metric * size
+            self.totals[key] = self.totals.get(key, 0) + (metric if key in COUNT_METRICS else metric * size)
         self.size += size
 
     def result(self, phase):
@@ -133,6 +142,7 @@ def _prepare(config):
         "action_horizon": config.action_horizon,
         "train_stride": train.dataset.stride, "val_stride": val.dataset.stride,
         "gamma": config.gamma, "camera_names": source.cameras,
+        "reward_mode": config.reward_mode,
         "reward_definition": "discounted_sparse_terminal_success_v1",
         "labels_sha256": _sha256(config.labels_path),
         "windows_sha256": {
@@ -143,12 +153,20 @@ def _prepare(config):
     }
     train_rl = RLChunkDataset(train, config.labels_path, gamma=config.gamma)
     val_rl = RLChunkDataset(val, config.labels_path, gamma=config.gamma)
-    return train_rl, val_rl, stats, split, contract, model_config
+    train_rl, val_rl, reward_contract = config.prepare_rewards(train_rl, val_rl)
+    return train_rl, val_rl, stats, split, {**contract, **reward_contract}, model_config
+
+
+def _check_reward_mode(state, mode):
+    saved = state["data_contract"].get("reward_mode", "sparse")
+    if saved != mode:
+        raise ValueError(f"Checkpoint reward_mode={saved!r} differs from this entry point's reward_mode={mode!r}")
 
 
 def _check_data(state, stats, split, contract, model_config):
+    saved_contract = {"reward_mode": "sparse", **state["data_contract"]}
     for key, value in contract.items():
-        if state["data_contract"][key] != value:
+        if saved_contract.get(key) != value:
             raise ValueError(f"Dataset {key} differs from the checkpoint")
     if state["split"] != split or state["normalization_stats"] != stats:
         raise ValueError("Dataset split or normalization statistics differ from the checkpoint")
@@ -244,7 +262,10 @@ def _train(config, directory, state):
             raise ValueError("num_steps precedes the checkpoint's training step")
 
     directory.mkdir(parents=True, exist_ok=state is not None)
-    columns = [f"{phase}/{key}" for phase in ("train", "val") for key in (*MEAN_METRICS, *COUNT_METRICS)]
+    metrics = (*MEAN_METRICS, *COUNT_METRICS)
+    if config.reward_mode == "dense":
+        metrics += tuple(f"{key}_mean" for key in DENSE_REWARD_FIELDS)
+    columns = [f"{phase}/{key}" for phase in ("train", "val") for key in metrics]
     logger = ExperimentLogger(directory, config, resume=state is not None, extra_columns=columns)
     checkpoint_dir = directory / "checkpoints"
     metadata = {"config": asdict(config), "split": split, "normalization_stats": stats,
@@ -288,14 +309,15 @@ def _train(config, directory, state):
 
 
 @torch.no_grad()
-def export_advantages(checkpoint, output, device=None):
+def export_advantages(checkpoint, output, device=None, *, config_type=IQLConfig):
     checkpoint, output = Path(checkpoint), Path(output)
     metadata_path = output.with_suffix(".metadata.json")
     if checkpoint.resolve() in (output.resolve(), metadata_path.resolve()):
         raise ValueError("Advantage export paths must differ from the checkpoint")
     checkpoint_hash = _sha256(checkpoint)
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    config = IQLConfig.from_dict(state["config"])
+    _check_reward_mode(state, config_type.reward_mode)
+    config = config_type.from_dict(state["config"])
     train, _, stats, split, contract, model_config = _prepare(config)
     _check_data(state, stats, split, contract, model_config)
     device = resolve_device(device or config.device)
@@ -303,11 +325,12 @@ def export_advantages(checkpoint, output, device=None):
     model.load_state_dict(state["critic"])
 
     # Advantage only needs the current observation. Keep the wrapped policy subset's order.
-    windows = _window_metadata(train.dataset, config.action_horizon)
+    policy_train = train.policy_dataset
+    windows = _window_metadata(policy_train, config.action_horizon)
     expected = {window_key(row): row["end_timestep"] for row in windows}
     if len(expected) != len(windows):
         raise ValueError("Training window keys are duplicated")
-    loader = DataLoader(train.dataset, batch_size=config.batch_size, num_workers=config.num_workers)
+    loader = DataLoader(policy_train, batch_size=config.batch_size, num_workers=config.num_workers)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")
     seen = set()
@@ -344,7 +367,7 @@ def export_advantages(checkpoint, output, device=None):
     return metadata
 
 
-def main(argv=None):
+def main(argv=None, *, config_type=IQLConfig, default_config="configs/iql_critic.json"):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     train = commands.add_parser("train")
@@ -358,19 +381,22 @@ def main(argv=None):
     export.add_argument("--device")
     args = parser.parse_args(argv)
     if args.command == "export":
-        metadata = export_advantages(args.checkpoint, args.output, args.device)
+        metadata = export_advantages(args.checkpoint, args.output, args.device, config_type=config_type)
         print(f"Exported {metadata['record_count']} windows to {args.output}")
         return
     state = torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
-    config_path = args.config or Path("configs/iql_critic.json")
+    if state is not None:
+        _check_reward_mode(state, config_type.reward_mode)
+    config_path = args.config or Path(default_config)
     values = deepcopy(state["config"]) if state is not None and args.config is None else json.loads(config_path.read_text())
-    config = IQLConfig.from_dict(apply_overrides(values, args.overrides))
+    config = config_type.from_dict(apply_overrides(values, args.overrides))
     if args.run_dir:
         directory = args.run_dir
     elif args.resume:
         directory = args.resume.resolve().parent.parent
     else:
-        directory = Path(config.output_root) / f"iql-critic-{datetime.now():%Y%m%d-%H%M%S-%f}"
+        name = "iql-dense-critic" if config.reward_mode == "dense" else "iql-critic"
+        directory = Path(config.output_root) / f"{name}-{datetime.now():%Y%m%d-%H%M%S-%f}"
     print(f"Critic checkpoint: {_train(config, directory, state)}")
 
 
