@@ -1,5 +1,6 @@
-"""Train an FM/AWR-FM policy from JSON configuration and optional CLI overrides."""
+"""Train an FM, AWR-FM or IQL-FM policy from JSON configuration and CLI overrides."""
 import argparse
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime
 import hashlib
@@ -15,11 +16,11 @@ from torch.utils.data import Subset
 from awbc_models import FlowMatchingPolicy, FlowMatchingPolicyConfig
 from awbc_data.dataset import ROBOMETER_CHUNK_SIZE
 from awbc_data.inspect import tensor_report
-from .config import ExperimentConfig, apply_overrides
+from .config import ExperimentConfig, WEIGHTED_OBJECTIVES, apply_overrides
 from .data import prepare_datasets
 from .runtime import resolve_device, seed_everything
 from .trainer import Trainer
-from .advantage import prepare_advantage_datasets
+from .advantage import prepare_advantage_datasets, prepare_iql_advantage_dataset
 
 
 def timestamp():
@@ -37,7 +38,7 @@ def main():
     if args.config:
         config = ExperimentConfig.from_json(args.config, args.overrides)
     elif state is not None:
-        config = ExperimentConfig.from_dict(apply_overrides(state["config"], args.overrides))
+        config = ExperimentConfig.from_dict(apply_overrides(deepcopy(state["config"]), args.overrides))
     else:
         config = ExperimentConfig.from_dict(apply_overrides({}, args.overrides))
     source = (str(args.config.resolve()) if args.config else
@@ -53,14 +54,26 @@ def main():
     policy_config = (FlowMatchingPolicyConfig.from_dict(state["policy_config"]) if state is not None
                      else config.policy_configuration(info))
     horizon = policy_config.dit.action_horizon
+    objective = config.training.objective
+    if state is not None and objective == "iql_fm":
+        requested = config.policy.get("dit", {}).get("action_horizon", horizon)
+        if requested != horizon:
+            raise ValueError(f"IQL-FM resume action_horizon={requested} differs from checkpoint action_horizon={horizon}; "
+                             "re-export labels and start a new run for the requested horizon")
     # Checkpoints made before configurable windows always used 10-step dataset chunks.
     data_horizon = state["split"].get("action_horizon", ROBOMETER_CHUNK_SIZE) if state is not None else horizon
     train, val, stats, manifest = prepare_datasets(config.dataset, policy_config.image_preprocess,
                                                    action_horizon=data_horizon)
     weighting, advantage_report = None, None
-    if config.training.objective == "awr_fm":
+    if objective == "iql_fm":
+        train, weighting, advantage_report = prepare_iql_advantage_dataset(
+            train, config.advantage_weighting, horizon, manifest)
+        manifest["iql_critic_checkpoint"] = advantage_report["critic_checkpoint"]
+        manifest["iql_advantage_statistics"] = advantage_report["statistics"]
+    elif objective == "awr_fm":
         train, val, weighting, advantage_report = prepare_advantage_datasets(
             train, val, config.advantage_weighting, horizon)
+    if objective in WEIGHTED_OBJECTIVES:
         manifest["advantage_fingerprint"] = advantage_report["fingerprint"]
         manifest["retained_train_samples"] = len(train)
         manifest["retained_val_samples"] = len(val)

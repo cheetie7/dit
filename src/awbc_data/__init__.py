@@ -2,5 +2,7 @@
 
 from .dataset import ChunkDataset, DatasetSource, build_datasets
 from .images import ImagePreprocessConfig, ImagePreprocessor
+from .iql import RLChunkDataset
 
-__all__ = ["ChunkDataset", "DatasetSource", "build_datasets", "ImagePreprocessConfig", "ImagePreprocessor"]
+__all__ = ["ChunkDataset", "DatasetSource", "build_datasets", "ImagePreprocessConfig", "ImagePreprocessor",
+           "RLChunkDataset"]

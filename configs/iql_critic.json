@@ -1,0 +1,31 @@
+{
+  "dataset": {
+    "root": "data/block_insertion_rgb_640x480_300_iql",
+    "val_fraction": 0.1,
+    "split_seed": 42,
+    "stratify_key": "tasks",
+    "train_stride": null
+  },
+  "labels_path": "data/block_insertion_rgb_640x480_300_iql/episode_end_labels.jsonl",
+  "action_horizon": 10,
+  "gamma": 0.99,
+  "expectile": 0.7,
+  "target_update_rate": 0.005,
+  "q_learning_rate": 0.0003,
+  "v_learning_rate": 0.0003,
+  "hidden_dims": [256, 256],
+  "pretrained": true,
+  "seed": 42,
+  "num_steps": 10000,
+  "batch_size": 16,
+  "num_workers": 0,
+  "device": "auto",
+  "validation_interval": 1000,
+  "checkpoint_interval": 5000,
+  "logging": {
+    "use_wandb": false,
+    "wandb_project": "iql-critic",
+    "log_interval": 10,
+    "progress_bar": true
+  }
+}

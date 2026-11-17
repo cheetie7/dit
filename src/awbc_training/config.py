@@ -6,6 +6,9 @@ from pathlib import Path
 from awbc_models import FlowMatchingPolicyConfig
 
 
+WEIGHTED_OBJECTIVES = ("awr_fm", "iql_fm")
+
+
 @dataclass
 class DatasetConfig:
     root: str = "data/block_insertion_real_combined_v30_advantage"

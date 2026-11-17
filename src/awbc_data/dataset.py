@@ -171,10 +171,21 @@ class ChunkDataset(Dataset):
         image = self.image_preprocessor(best.to_image())
         return image, float(best.pts * stream.time_base), target
 
+    def read_observation(self, episode_index, frame_index):
+        """Read a normalized observation and its per-camera video timestamps."""
+        decoded = [self._image(episode_index, frame_index, camera) for camera in self.source.cameras]
+        state = self.source.rows[episode_index]["observation.state"][frame_index]
+        return {
+            "observation": {"images": torch.stack([x[0] for x in decoded]),
+                            "state": self.normalize("observation.state", torch.from_numpy(state.copy()))},
+            "video_timestamp": torch.tensor([x[1] for x in decoded], dtype=torch.float64),
+            "video_target_timestamp": torch.tensor([x[2] for x in decoded], dtype=torch.float64),
+        }
+
     def __getitem__(self, idx):
         eid, t, length = self.samples[idx]
         data = self.source.rows[eid]
-        decoded = [self._image(eid, t, camera) for camera in self.source.cameras]
+        observation = self.read_observation(eid, t)
         actions = torch.from_numpy(data["action"][t:t + length].copy())
         actions = torch.cat((actions, actions[-1:].repeat(self.action_horizon - length, 1)))
         # The AWR wrapper supplies the joined label when the window differs from the source chunks.
@@ -182,16 +193,13 @@ class ChunkDataset(Dataset):
             self.source.has_advantage and self.action_horizon == ROBOMETER_CHUNK_SIZE and bool(data[LABELS[2]][t])
         )
         return {
-            "observation": {"images": torch.stack([x[0] for x in decoded]),
-                            "state": self.normalize("observation.state", torch.from_numpy(data["observation.state"][t].copy()))},
+            **observation,
             "action": self.normalize("action", actions),
             "action_is_pad": torch.arange(self.action_horizon) >= length,
             "advantage": torch.tensor(float(data[LABELS[0]][t]) if has_native_label else 0, dtype=torch.float32),
             "advantage_valid": torch.tensor(has_native_label),
             "episode_index": torch.tensor(eid), "frame_index": torch.tensor(t),
             "timestamp": torch.tensor(float(data["timestamp"][t]), dtype=torch.float64),
-            "video_timestamp": torch.tensor([x[1] for x in decoded], dtype=torch.float64),
-            "video_target_timestamp": torch.tensor([x[2] for x in decoded], dtype=torch.float64),
             "valid_length": torch.tensor(length),
         }
 

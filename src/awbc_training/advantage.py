@@ -1,3 +1,4 @@
+from dataclasses import asdict
 import hashlib
 import json
 import logging
@@ -8,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import Subset
 
-from awbc_data.advantage import AdvantageDataset, PrecomputedAdvantageProvider, sample_metadata, window_metadata
+from awbc_data.advantage import AdvantageDataset, PrecomputedAdvantageProvider, sample_metadata, window_key, window_metadata
 from awbc_data.dataset import ROBOMETER_CHUNK_SIZE, action_windows
 from awbc_models.advantage_weighting import AdvantageNormalizer, AdvantageWeighting
 
@@ -181,23 +182,71 @@ def prepare_advantage_datasets(train, val, config, horizon):
     fit_records = [provider.get_record(sample_metadata(full_train, index, horizon))
                    for index in range(len(full_train))
                    if (full_train.samples[index][0], full_train.samples[index][1], horizon) in provider.records]
+    weighting, stats = fit_weighting(provider, fit_records, full_train.episode_ids, config)
+    report = {**provider.provenance_report(full_train.episode_ids, full_val.episode_ids),
+              "coverage": coverage, "statistics": stats, "normalization_mode": config.normalization}
+    return AdvantageDataset(train, provider, horizon, config.missing_label_policy), val, weighting, report
+
+
+def fit_weighting(provider, fit_records, train_ids, config):
     if not fit_records:
         raise ValueError("No labeled training windows remain after the missing-label policy")
     values = torch.tensor([row["advantage"] for row in fit_records], dtype=torch.float64)
     ids = sorted(row["sample_id"] for row in fit_records)
     stats = {"mean": values.mean().item(), "std": values.std(correction=0).item(), "count": len(values),
-             "training_trajectory_ids": list(full_train.episode_ids), "provider_fingerprint": provider.fingerprint,
+             "training_trajectory_ids": list(train_ids), "provider_fingerprint": provider.fingerprint,
              "sample_ids_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest()}
     if config.statistics_path:
         loaded = json.loads(Path(config.statistics_path).read_text())
-        if loaded["provider_fingerprint"] != provider.fingerprint or set(loaded["training_trajectory_ids"]) != set(full_train.episode_ids):
+        if loaded["provider_fingerprint"] != provider.fingerprint or set(loaded["training_trajectory_ids"]) != set(train_ids):
             raise ValueError("Advantage statistics do not belong to this label version and training split")
         stats = loaded
     weighting = AdvantageWeighting(AdvantageNormalizer(config.normalization, stats["mean"], stats["std"]),
                                    config.beta, config.min_weight, config.max_weight, config.detach_weights)
-    report = {**provider.provenance_report(full_train.episode_ids, full_val.episode_ids),
-              "coverage": coverage, "statistics": stats, "normalization_mode": config.normalization}
-    return AdvantageDataset(train, provider, horizon, config.missing_label_policy), val, weighting, report
+    return weighting, stats
+
+
+def prepare_iql_advantage_dataset(train, config, horizon, split):
+    """Join the critic's exact training-window export to the policy training subset."""
+    if not config.enabled or not config.labels_path or not config.metadata_path:
+        raise ValueError("iql_fm requires advantage_weighting.enabled, labels_path and metadata_path")
+    if config.missing_label_policy != "error" or not config.detach_weights:
+        raise ValueError("iql_fm requires complete labels and detached weights")
+    full_train = base_dataset(train)
+    export = json.loads(Path(config.metadata_path).read_text())
+    contract = export["data_contract"]
+    checkpoint = export["checkpoint"]
+    for key, expected in (("action_horizon", horizon), ("train_stride", full_train.stride)):
+        if contract[key] != expected:
+            raise ValueError(f"IQL critic {key}={contract[key]} differs from policy {key}={expected}; "
+                             "re-export IQL labels for the current policy windows")
+    for key in ("train_episodes", "val_episodes", "train_sample_indices", "val_sample_indices"):
+        if export["split"][key] != split[key]:
+            raise ValueError(f"IQL critic split differs from policy at {key}; re-export for the current split")
+    fps = full_train.source.fps
+    metadata = {
+        "source": "iql", "semantics": "advantage", "window_length": horizon, "sampling_frequency": fps,
+        "training_trajectory_ids": split["train_episodes"], "evaluation_trajectory_ids": split["train_episodes"],
+        "model_version": checkpoint["sha256"], "advantage_definition": export["advantage_definition"],
+        "critic_export": export,
+    }
+    provider = PrecomputedAdvantageProvider.from_file(config.labels_path, metadata)
+    windows = [sample_metadata(train, index, horizon) for index in range(len(train))]
+    coverage = provider.validate_windows(windows, fps)
+    for window in windows:
+        record = provider.get_record(window)
+        expected_length = window["end_timestep"] - window["start_timestep"]
+        length = record.get("valid_length")
+        if type(length) is not int or length != expected_length:
+            raise ValueError(f"IQL valid_length={length!r} at {window_key(window)}; expected {expected_length}")
+    if export["record_count"] != coverage["label_count"]:
+        raise ValueError("IQL label count differs from the critic export metadata")
+    dataset = AdvantageDataset(train, provider, horizon)
+    weighting, stats = fit_weighting(provider, dataset.records, full_train.episode_ids, config)
+    report = {**provider.provenance_report(split["train_episodes"], split["val_episodes"]),
+              "coverage": coverage, "statistics": stats, "normalization_mode": config.normalization,
+              "critic_checkpoint": checkpoint, "weight_configuration": asdict(config)}
+    return dataset, weighting, report
 
 
 def training_forward(policy, batch, weighting=None, **pair):

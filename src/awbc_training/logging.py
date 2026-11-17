@@ -5,7 +5,7 @@ import logging
 
 
 class ExperimentLogger:
-    def __init__(self, directory, config, resume=False):
+    def __init__(self, directory, config, resume=False, *, extra_columns=()):
         self.logger = logging.getLogger(str(directory))
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
@@ -23,6 +23,7 @@ class ExperimentLogger:
                     "advantage/max", "advantage/median", "weight/mean", "weight/std", "weight/min", "weight/max",
                     "weight/clip_fraction", "weight/effective_sample_size", "weight/ess_ratio",
                     "weight/largest_trajectory_mass_fraction", "weight/minimum_fraction"]
+        columns.extend(extra_columns)
         self.csv = csv.DictWriter(self.csv_file, fieldnames=columns, extrasaction="ignore")
         if not has_header:
             self.csv.writeheader()

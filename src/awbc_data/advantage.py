@@ -52,12 +52,20 @@ class PrecomputedAdvantageProvider(AdvantageProvider):
         for original in records:
             row = dict(original)
             key = window_key(row)
+            if metadata["source"] == "iql":
+                episode, start, horizon = key
+                if any(type(value) is not int for value in (*key, row["end_timestep"])):
+                    raise ValueError(f"IQL window key and end_timestep must be integers at {key}")
+                row.setdefault("sample_id", window_metadata(episode, start, row["end_timestep"] - start, horizon)["sample_id"])
             if row["sample_id"] in ids or key in self.records:
                 raise ValueError(f"Duplicate sample_id or window key: {row['sample_id']} / {key}")
             if not math.isfinite(float(row["advantage"])):
                 raise ValueError(f"Nonfinite advantage at {key}")
             if row["action_horizon"] != metadata["window_length"]:
-                raise ValueError(f"Label horizon differs from metadata at {key}")
+                message = f"Label horizon {row['action_horizon']} differs from metadata horizon {metadata['window_length']} at {key}"
+                if metadata["source"] == "iql":
+                    message += "; re-export IQL labels for the current policy windows"
+                raise ValueError(message)
             row.setdefault("advantage_source", metadata["source"])
             row.setdefault("advantage_model_version", metadata.get("model_version"))
             if row["advantage_source"] != metadata["source"] or row["advantage_model_version"] != metadata.get("model_version"):
@@ -117,7 +125,8 @@ class PrecomputedAdvantageProvider(AdvantageProvider):
             raise ValueError(f"Missing advantage for {len(missing)} windows, e.g. {next(iter(missing))}")
         for key in set(expected) & set(self.records):
             if self.records[key]["end_timestep"] != expected[key]["end_timestep"]:
-                raise ValueError(f"Label end_timestep does not match real valid actions at {key}")
+                actual = self.records[key]["end_timestep"]
+                raise ValueError(f"Label end_timestep={actual} at {key}; expected {expected[key]['end_timestep']}")
         return {"expected_windows": len(expected), "label_count": len(self.records),
                 "missing_windows": len(missing), "missing_label_policy": missing_policy}
 

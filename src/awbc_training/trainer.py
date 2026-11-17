@@ -9,6 +9,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from awbc_models.euler import synchronize
 from .checkpoint import save_checkpoint
+from .config import WEIGHTED_OBJECTIVES
 from .ema import EMA
 from .logging import ExperimentLogger
 from .optim import build_optimizer, build_scheduler, optimizer_summary
@@ -39,17 +40,19 @@ class Trainer:
         self.last_update_metrics = {}
         self.last_validation_step = -1
         self.last_validation = {}
-        if config.training.objective not in ("fm", "awr_fm"):
-            raise ValueError("training.objective must be fm or awr_fm")
-        self.weighting = weighting.to(device) if weighting is not None and config.training.objective == "awr_fm" else None
-        if config.training.objective == "awr_fm" and self.weighting is None:
-            raise ValueError("awr_fm requires aligned labels and an AdvantageWeighting module")
+        objective = config.training.objective
+        if objective not in ("fm", *WEIGHTED_OBJECTIVES):
+            raise ValueError("training.objective must be fm, awr_fm or iql_fm")
+        weighted = objective in WEIGHTED_OBJECTIVES
+        self.weighting = weighting.to(device) if weighting is not None and weighted else None
+        if weighted and self.weighting is None:
+            raise ValueError(f"{objective} requires aligned labels and an AdvantageWeighting module")
         self.dataset_weights = self.weighting(advantage_values(train_dataset).to(device)).detach().cpu() if self.weighting else None
         self.epoch_awr_rows = []
         self.epoch_weighted_sum = self.epoch_weight_sum = 0.
-        self.logger = ExperimentLogger(directory, config, resume=resume_state is not None)
         if resume_state is not None:
             self.load_state(resume_state)
+        self.logger = ExperimentLogger(directory, config, resume=resume_state is not None)
         self.summary = optimizer_summary(self.policy, self.optimizer)
         self.logger.logger.info("Parameters and optimizer: %s", self.summary)
         self.logger.logger.info("Device=%s AMP=%s scaler=%s planned updates=%s", device,
@@ -123,13 +126,20 @@ class Trainer:
                 "last_validation_step": self.last_validation_step, "last_validation": self.last_validation}
 
     def load_state(self, state):
+        original = state["config"]["training"]
+        objective = self.config.training.objective
+        if original.get("objective", "fm") != objective:
+            raise ValueError("Resume cannot change the training objective; start a separate comparison run")
+        if objective == "iql_fm":
+            for key, description in (("iql_critic_checkpoint", "critic checkpoint"),
+                                     ("advantage_fingerprint", "label fingerprint"),
+                                     ("iql_advantage_statistics", "normalization statistics")):
+                if state["split"][key] != self.manifest[key]:
+                    raise ValueError(f"Resume IQL Advantage {description} differs from the checkpoint")
         if state["normalization_stats"] != self.stats or state["split"] != self.manifest:
             raise ValueError("Resume dataset split/statistics differ from the checkpoint")
         if state["total_steps"] != self.total_steps:
             raise ValueError("Resume must retain the original total optimizer-update budget")
-        original = state["config"]["training"]
-        if original.get("objective", "fm") != self.config.training.objective:
-            raise ValueError("Resume cannot change the training objective; start a separate comparison run")
         if state["config"].get("advantage_weighting", {}) != asdict(self.config.advantage_weighting) and self.weighting:
             raise ValueError("Resume must retain the original advantage normalization/weighting configuration")
         if any(original[key] != getattr(self.config.training, key)
