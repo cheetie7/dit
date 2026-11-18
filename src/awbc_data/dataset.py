@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .images import IMAGENET_MEAN, IMAGENET_STD, ImagePreprocessConfig, ImagePreprocessor
+from .state import action_selection, state_selection
 
 ROBOMETER_CHUNK_SIZE = 10
 LABELS = ("annotation.advantage", "annotation.advantage_valid",
@@ -29,13 +30,17 @@ def action_windows(num_transitions, horizon, stride=None):
 class DatasetSource:
     """Small numeric columns stay in RAM; shared MP4 files are decoded lazily."""
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, state_indices: list[int] | None = None,
+                 action_indices: list[int] | None = None):
         self.root = Path(root).resolve()
         self.info = json.loads((self.root / "meta/info.json").read_text())
         if self.info["codebase_version"] != "v3.0":
             raise ValueError("Only LeRobot v3.0 is supported")
         self.fps = float(self.info["fps"])
         self.cameras = tuple(k for k, v in self.info["features"].items() if v["dtype"] == "video")
+        self.state_selection = state_selection(self.info["features"]["observation.state"]["shape"][0], state_indices)
+        self.action_selection = action_selection(self.info["features"]["action"]["shape"][0], action_indices)
+        action_columns = self.action_selection["action_indices"]
         self.episodes = {}
         for path in sorted((self.root / "meta/episodes").rglob("*.parquet")):
             for ep in pq.read_table(path).to_pylist():
@@ -68,13 +73,19 @@ class DatasetSource:
                 raise ValueError(f"Invalid frame sequence in episode {eid}")
             for key in ("observation.state", "action"):
                 data[key] = data[key].astype(np.float32)
+            if action_columns is not None:
+                data["action"] = data["action"][:, action_columns]
             self.rows[eid] = data
+
+    def select_state(self, values):
+        indices = self.state_selection["state_indices"]
+        return values if indices is None else values[..., indices]
 
     def statistics(self, episode_ids):
         """Training frames only, no duplicate chunk rows or padded actions."""
         result = {"train_episode_ids": list(episode_ids), "normalization": "min_max"}
         for key in ("observation.state", "action"):
-            values = np.concatenate([self.rows[e][key][:-1] if key == "action" else self.rows[e][key]
+            values = np.concatenate([self.rows[e][key][:-1] if key == "action" else self.select_state(self.rows[e][key])
                                      for e in episode_ids]).astype(np.float64)
             result[key] = {"count": len(values), **{k: v.tolist() for k, v in {
                 "min": values.min(0), "max": values.max(0),
@@ -174,7 +185,7 @@ class ChunkDataset(Dataset):
     def read_observation(self, episode_index, frame_index):
         """Read a normalized observation and its per-camera video timestamps."""
         decoded = [self._image(episode_index, frame_index, camera) for camera in self.source.cameras]
-        state = self.source.rows[episode_index]["observation.state"][frame_index]
+        state = self.source.select_state(self.source.rows[episode_index]["observation.state"][frame_index])
         return {
             "observation": {"images": torch.stack([x[0] for x in decoded]),
                             "state": self.normalize("observation.state", torch.from_numpy(state.copy()))},

@@ -25,6 +25,7 @@ wandb = ["wandb>=0.17"]
 
 [project.scripts]
 awbc-train = "awbc_training.train:main"
+awbc-eval-sim = "awbc_training.eval_sim:main"
 awbc-inspect-data = "awbc_data.inspect:main"
 awbc-smoke = "awbc_training.inspect_advantage:main"
 awbc-inspect-policy = "awbc_models.inspect_policy:main"

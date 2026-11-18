@@ -12,6 +12,7 @@ from torch.utils.data import Subset
 from awbc_data.advantage import AdvantageDataset, PrecomputedAdvantageProvider, sample_metadata, window_key, window_metadata
 from awbc_data.dataset import ROBOMETER_CHUNK_SIZE, action_windows
 from awbc_data.iql_dense import load_progress
+from awbc_data.state import action_selection, state_selection
 from awbc_models.advantage_weighting import AdvantageNormalizer, AdvantageWeighting
 from awbc_models.dense_awbc_weighting import DenseAWBCWeighting
 
@@ -228,6 +229,16 @@ def join_iql_advantages(train, config, horizon, split, *, require_dense=False):
         if contract[key] != expected:
             raise ValueError(f"IQL critic {key}={contract[key]} differs from policy {key}={expected}; "
                              "re-export IQL labels for the current policy windows")
+    policy_state = full_train.source.state_selection
+    critic_state = contract.get("state_selection", state_selection(policy_state["raw_state_dim"]))
+    if critic_state != policy_state:
+        raise ValueError(f"IQL critic state selection {critic_state} differs from policy {policy_state}; "
+                         "use the same ordered state_indices for critic and policy")
+    policy_actions = full_train.source.action_selection
+    critic_actions = contract.get("action_selection", action_selection(policy_actions["raw_action_dim"]))
+    if critic_actions != policy_actions:
+        raise ValueError(f"IQL critic action selection {critic_actions} differs from policy {policy_actions}; "
+                         "use the same ordered action_indices for critic and policy")
     for key in ("train_episodes", "val_episodes", "train_sample_indices", "val_sample_indices"):
         if export["split"][key] != split[key]:
             raise ValueError(f"IQL critic split differs from policy at {key}; re-export for the current split")

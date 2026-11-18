@@ -1,0 +1,16 @@
+{
+  "camera_map": {
+    "observation.images.eye": "eye_rgb",
+    "observation.images.left_wrist": "left_wrist_rgb",
+    "observation.images.right_wrist": "right_wrist_rgb"
+  },
+  "image_size": [480, 640],
+  "state_layout": "simulation_simple_lerobot_v3",
+  "action_layout": "simulation_simple_lerobot_v3",
+  "controlled_arms": ["left"],
+  "action_contract": {
+    "type": "absolute_joint_position",
+    "arm_unit": "radian",
+    "gripper_unit": "actuator_coordinate"
+  }
+}

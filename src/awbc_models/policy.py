@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from awbc_data import ImagePreprocessConfig, ImagePreprocessor
+from awbc_data.state import action_selection, state_selection
 from .dit import ConditionalDiT, ConditionalDiTConfig
 from .euler import sample_euler, synchronize, timed_call
 from .flow_matching_objective import FlowMatchingObjective
@@ -27,9 +28,26 @@ class FlowMatchingPolicyConfig:
     normalization_stats_path: str | None = None
     num_inference_steps: int = 8
     n_action_steps: int = 8
+    state_indices: list[int] | None = None
+    raw_state_dim: int | None = None
+    action_indices: list[int] | None = None
+    raw_action_dim: int | None = None
+    action_fps: float | None = None
 
     def __post_init__(self):
         self.camera_names = tuple(self.camera_names)
+        if self.raw_state_dim is None and self.state_indices is None:
+            self.raw_state_dim = self.observation.state_dim
+        selection = state_selection(self.raw_state_dim, self.state_indices)
+        self.state_indices = selection["state_indices"]
+        if self.observation.use_state and self.observation.state_dim != selection["state_dim"]:
+            raise ValueError("observation.state_dim must match the selected state dimension")
+        if self.raw_action_dim is None and self.action_indices is None:
+            self.raw_action_dim = self.dit.action_dim
+        actions = action_selection(self.raw_action_dim, self.action_indices)
+        self.action_indices = actions["action_indices"]
+        if self.dit.action_dim != actions["action_dim"]:
+            raise ValueError("dit.action_dim must match the selected action dimension")
         if not 1 <= self.n_action_steps <= self.dit.action_horizon:
             raise ValueError("n_action_steps must be between 1 and action_horizon")
 
@@ -49,12 +67,17 @@ class FlowMatchingPolicyConfig:
         dit = dict(values.pop("dit", {}))
         if dataset_info is not None:
             features = dataset_info["features"]
+            values.setdefault("action_fps", dataset_info.get("fps"))
             names = tuple(k for k, v in features.items() if v["dtype"] == "video")
             values["camera_names"] = names
             vision["num_cameras"] = len(names)
-            dit["action_dim"] = features["action"]["shape"][0]
+            raw_action_dim = features["action"]["shape"][0]
+            values["raw_action_dim"] = raw_action_dim
+            dit["action_dim"] = action_selection(raw_action_dim, values.get("action_indices"))["action_dim"]
             if "observation.state" in features:
-                observation["state_dim"] = features["observation.state"]["shape"][0]
+                raw_dim = features["observation.state"]["shape"][0]
+                values["raw_state_dim"] = raw_dim
+                observation["state_dim"] = state_selection(raw_dim, values.get("state_indices"))["state_dim"]
             else:
                 observation["use_state"] = False
         preprocessing = ImagePreprocessConfig(**values.pop("image_preprocess", {}))
@@ -110,6 +133,10 @@ class FlowMatchingPolicy(nn.Module):
         output = {"images": images}
         if self.config.observation.use_state:
             state = torch.as_tensor(raw_observation["state"], device=reference.device, dtype=torch.float32)
+            if state.shape != (self.config.raw_state_dim,):
+                raise ValueError(f"Expected a raw state vector of length {self.config.raw_state_dim}, got {tuple(state.shape)}")
+            if self.config.state_indices is not None:
+                state = state[self.config.state_indices]
             output["state"] = self.state_normalizer.normalize(state).unsqueeze(0).to(reference)
         return output
 

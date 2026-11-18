@@ -4,7 +4,9 @@
     "val_fraction": 0.1,
     "split_seed": 42,
     "stratify_key": "tasks",
-    "train_stride": null
+    "train_stride": null,
+    "state_indices": [0, 1, 2, 3, 4, 5, 6, 28],
+    "action_indices": [0, 1, 2, 3, 4, 5, 6, 7]
   },
   "labels_path": "data/block_insertion_rgb_640x480_300_iql/episode_end_labels.jsonl",
   "action_horizon": 10,

@@ -14,7 +14,9 @@
     "stratify_key": "tasks",
     "max_train_samples": null,
     "max_val_samples": null,
-    "train_stride": null
+    "train_stride": null,
+    "state_indices": [0, 1, 2, 3, 4, 5, 6, 28],
+    "action_indices": [0, 1, 2, 3, 4, 5, 6, 7]
   },
   "training": {
     "seed": 42,

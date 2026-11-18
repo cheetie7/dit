@@ -15,4 +15,5 @@ wandb/
 *.pth
 *.safetensors
 configs/*.local.json
+/external/simulation-simple
 

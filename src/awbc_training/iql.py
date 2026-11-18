@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 
 from awbc_data import ImagePreprocessConfig, RLChunkDataset
 from awbc_data.advantage import sample_metadata, window_key
+from awbc_data.state import action_selection, state_selection
 from awbc_models.iql_critic import IQLCritic, IQLCriticConfig
 from .checkpoint import save_checkpoint
 from .config import DatasetConfig, LoggingConfig, apply_overrides
@@ -133,15 +134,16 @@ def _prepare(config):
         config.dataset, config.image_preprocess, action_horizon=config.action_horizon
     )
     source = train.dataset.source
-    features = source.info["features"]
     model_config = IQLCriticConfig(
-        len(source.cameras), features["observation.state"]["shape"][0], features["action"]["shape"][0],
+        len(source.cameras), source.state_selection["state_dim"], source.action_selection["action_dim"],
         config.action_horizon, config.hidden_dims, config.pretrained,
     )
     contract = {
         "action_horizon": config.action_horizon,
         "train_stride": train.dataset.stride, "val_stride": val.dataset.stride,
         "gamma": config.gamma, "camera_names": source.cameras,
+        "state_selection": source.state_selection,
+        "action_selection": source.action_selection,
         "reward_mode": config.reward_mode,
         "reward_definition": "discounted_sparse_terminal_success_v1",
         "labels_sha256": _sha256(config.labels_path),
@@ -164,7 +166,12 @@ def _check_reward_mode(state, mode):
 
 
 def _check_data(state, stats, split, contract, model_config):
-    saved_contract = {"reward_mode": "sparse", **state["data_contract"]}
+    saved_contract = {
+        "reward_mode": "sparse",
+        "state_selection": state_selection(state["model_config"]["state_dim"]),
+        "action_selection": action_selection(state["model_config"]["action_dim"]),
+        **state["data_contract"],
+    }
     for key, value in contract.items():
         if saved_contract.get(key) != value:
             raise ValueError(f"Dataset {key} differs from the checkpoint")

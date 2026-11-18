@@ -4,6 +4,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from awbc_models import FlowMatchingPolicyConfig
+from awbc_data.state import action_selection, state_selection
 
 
 IQL_OBJECTIVES = ("iql_fm", "iql_dense_awbc")
@@ -19,6 +20,8 @@ class DatasetConfig:
     max_train_samples: int | None = None
     max_val_samples: int | None = None
     train_stride: int | None = None  # None uses the action horizon as the training stride.
+    state_indices: list[int] | None = None
+    action_indices: list[int] | None = None
 
 
 @dataclass
@@ -153,6 +156,14 @@ class ExperimentConfig:
         for key, value in self.policy.items():
             original = getattr(base, key)
             updates[key] = replace(original, **value) if hasattr(original, "__dataclass_fields__") else value
+        selection = state_selection(base.raw_state_dim, self.dataset.state_indices)
+        updates["observation"] = replace(updates.get("observation", base.observation), state_dim=selection["state_dim"])
+        updates["raw_state_dim"] = selection["raw_state_dim"]
+        updates["state_indices"] = selection["state_indices"]
+        actions = action_selection(base.raw_action_dim, self.dataset.action_indices)
+        updates["dit"] = replace(updates.get("dit", base.dit), action_dim=actions["action_dim"])
+        updates["raw_action_dim"] = actions["raw_action_dim"]
+        updates["action_indices"] = actions["action_indices"]
         return replace(base, **updates)
 
     def to_json(self, path):

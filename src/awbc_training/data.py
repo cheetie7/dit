@@ -9,7 +9,7 @@ from awbc_data.dataset import ROBOMETER_CHUNK_SIZE
 
 
 def prepare_datasets(config, image_preprocess, *, action_horizon=ROBOMETER_CHUNK_SIZE):
-    source = DatasetSource(config.root)
+    source = DatasetSource(config.root, state_indices=config.state_indices, action_indices=config.action_indices)
     groups = defaultdict(list)
     for eid in sorted(source.episodes):
         value = source.episodes[eid][config.stratify_key] if config.stratify_key else "all"

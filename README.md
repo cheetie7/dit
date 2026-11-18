@@ -16,6 +16,41 @@ python -m pip install -e '.[wandb]'
 
 本机验证版本：Python 3.12、PyTorch 2.11.0、torchvision 0.26.0。CUDA、MPS 或 CPU 由 training.device 配置；GPU 上的 AMP 支持以运行时检查为准。
 
+## 仿真环境
+
+私有仓库 [Songan-Lab/simulation-simple](https://github.com/Songan-Lab/simulation-simple.git) 的本地入口固定为 `external/simulation-simple`。在 DiT 仓库根目录检查 GitHub CLI 登录和仓库读取权限。未登录时运行 `gh auth login --hostname github.com --git-protocol https --web`，按浏览器提示完成认证。
+
+```bash
+gh auth status --hostname github.com
+gh repo view Songan-Lab/simulation-simple
+mkdir -p external
+gh repo clone Songan-Lab/simulation-simple external/simulation-simple &&
+git -C external/simulation-simple submodule update --init --recursive
+```
+
+如果目标目录已有 checkout，先确认其 `origin` 指向上述仓库，再复用目录并初始化子模块。仿真 checkout 由自己的 Git 仓库管理。仿真环境使用该仓库的 Python 3.11、`uv.lock` 和 `.venv`。DiT 继续使用上面配置的训练环境。
+
+### 独立仿真评测
+
+在支持 MuJoCo 渲染的机器上，从 DiT 根目录把评测入口安装到仿真的 Python 3.11 环境。下面以单左臂的 block insertion checkpoint 为例。Linux 无显示器时可在评测命令前设置 `MUJOCO_GL=egl`。
+
+```bash
+uv sync --project external/simulation-simple --locked
+uv pip install --python external/simulation-simple/.venv/bin/python --no-deps -e .
+external/simulation-simple/.venv/bin/awbc-eval-sim \
+  --checkpoint /path/to/actor/checkpoints/latest_checkpoint.pt --weights ema --device auto \
+  --dataset-root /path/to/block_insertion_rgb_640x480_300_iql \
+  --mapping configs/eval_sim_block_insertion.json \
+  --seed 42 --noise-seed 1234 --episodes 10 --max-control-ticks 2500 \
+  --output-dir outputs/block_insertion_eval
+```
+
+`--weights raw` 加载普通权重。映射文件的 `camera_map` 从 checkpoint 相机键映射到仿真的 RGB 字段，`image_size` 是原始渲染的 `[height, width]`。示例使用 LeRobot v3 导出的状态顺序 `joint_pos`、`joint_vel`、`gripper_pos`、`ee_pos`、`ee_quat`，各字段内左臂在前。位置和速度的关节单位分别为弧度和弧度每秒，夹爪状态是驱动关节角（弧度），末端位置是米，四元数顺序为 WXYZ。动作是绝对位置目标，关节用弧度，夹爪用仿真的 actuator coordinate。其他训练布局可用有序的 `state_names` 和 `action_names` 指定训练元数据的原始列名，并将 `controlled_arms` 与 checkpoint 所选动作列对应。当前左臂映射在 reset 后保存右臂的控制目标，整条轨迹复用该目标。
+
+提供 `--dataset-root` 时会核对 `meta/info.json` 的字段、相机分辨率和动作频率。旧 checkpoint 缺少频率时，可提供 `--dataset-root` 或显式传 `--action-fps 25`。100 Hz 仿真控制对应每个 25 Hz 动作保持 4 个 tick。每条轨迹独立记录环境和推理噪声 seed，两者按 episode 序号递增。
+
+评测使用新建的输出目录，写入 `rollouts.jsonl`、`summary.json` 和 `errors.jsonl`。异常会停止批次，已完成的结果仍可检查，汇总中的 `complete` 为 `false`，`success_rate` 为 `null`。
+
 ## 项目结构
 
 ```text

@@ -64,6 +64,15 @@ def main():
     data_horizon = state["split"].get("action_horizon", ROBOMETER_CHUNK_SIZE) if state is not None else horizon
     train, val, stats, manifest = prepare_datasets(config.dataset, policy_config.image_preprocess,
                                                    action_horizon=data_horizon)
+    if state is not None:
+        selection = train.dataset.source.state_selection
+        if (policy_config.state_indices != selection["state_indices"]
+                or (policy_config.raw_state_dim is not None and policy_config.raw_state_dim != selection["raw_state_dim"])):
+            raise ValueError("Resume state_indices or raw state dimension differs from the policy checkpoint")
+        actions = train.dataset.source.action_selection
+        if (policy_config.action_indices != actions["action_indices"]
+                or policy_config.raw_action_dim != actions["raw_action_dim"]):
+            raise ValueError("Resume action_indices or raw action dimension differs from the policy checkpoint")
     weighting, advantage_report = None, None
     if objective == "iql_fm":
         train, weighting, advantage_report = prepare_iql_advantage_dataset(
