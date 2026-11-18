@@ -217,6 +217,7 @@ def test_cli_writes_rollouts_and_handles_incomplete_evaluation(evaluation, tmp_p
         "--episodes", "2", "--output-dir", str(output),
     ])
     assert loads == [(checkpoint, True, "cpu")] and env.closed
+    assert env.max_episode_steps == 2500
     assert env.seeds == [20, 21]
     records = [json.loads(row) for row in (output / "rollouts.jsonl").read_text().splitlines()]
     assert [row["noise_seed"] for row in records] == [95, 96]

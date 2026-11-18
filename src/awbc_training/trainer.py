@@ -17,6 +17,7 @@ from .optim import build_optimizer, build_scheduler, optimizer_summary
 from .runtime import Precision, move_batch, restore_rng, rng_state
 from .advantage import advantage_values, training_forward
 from .advantage_analysis import DENSE_WEIGHT_METRICS, summarize_rows, write_analysis
+from .sim_validation import SIM_METRICS, evaluate_snapshot
 
 
 class Trainer:
@@ -41,6 +42,8 @@ class Trainer:
         self.last_update_metrics = {}
         self.last_validation_step = -1
         self.last_validation = {}
+        self.last_sim_eval_step = -1
+        self.last_sim_eval = {}
         objective = config.training.objective
         if objective not in ("fm", *WEIGHTED_OBJECTIVES):
             raise ValueError(f"training.objective must be one of {('fm', *WEIGHTED_OBJECTIVES)}")
@@ -63,7 +66,7 @@ class Trainer:
         if resume_state is not None:
             self.load_state(resume_state)
         self.logger = ExperimentLogger(directory, config, resume=resume_state is not None,
-                                       extra_columns=DENSE_WEIGHT_METRICS if self.dense_weighting else ())
+                                       extra_columns=(*DENSE_WEIGHT_METRICS, *SIM_METRICS))
         self.summary = optimizer_summary(self.policy, self.optimizer)
         self.logger.logger.info("Parameters and optimizer: %s", self.summary)
         self.logger.logger.info("Device=%s AMP=%s scaler=%s planned updates=%s", device,
@@ -134,7 +137,8 @@ class Trainer:
                 "advantage_weighting": self.weighting.state_dict() if self.weighting else None,
                 "epoch_awr_rows": self.epoch_awr_rows, "epoch_weighted_sum": self.epoch_weighted_sum,
                 "epoch_weight_sum": self.epoch_weight_sum,
-                "last_validation_step": self.last_validation_step, "last_validation": self.last_validation}
+                "last_validation_step": self.last_validation_step, "last_validation": self.last_validation,
+                "last_sim_eval_step": self.last_sim_eval_step, "last_sim_eval": self.last_sim_eval}
 
     def load_state(self, state):
         original = state["config"]["training"]
@@ -174,6 +178,8 @@ class Trainer:
         self.epoch_weight_sum = state.get("epoch_weight_sum", 0.)
         self.last_validation_step = state.get("last_validation_step", -1)
         self.last_validation = state.get("last_validation", {})
+        self.last_sim_eval_step = state.get("last_sim_eval_step", -1)
+        self.last_sim_eval = state.get("last_sim_eval", {})
         for name in ("epoch", "batch_in_epoch", "global_step", "epoch_loss_sum", "epoch_samples", "epoch_seconds", "fixed_pair", "last_update_metrics"):
             setattr(self, name, state[name])
         restore_rng(state["rng_state"])
@@ -189,6 +195,11 @@ class Trainer:
         self.last_validation_step = self.global_step
         self.logger.log({"epoch": self.epoch, "global_step": self.global_step, **self.last_validation})
         self.policy.train()
+
+    def _sim_evaluate_and_log(self):
+        self.last_sim_eval = evaluate_snapshot(self)
+        self.last_sim_eval_step = self.global_step
+        self.logger.log({"epoch": self.epoch, "global_step": self.global_step, **self.last_sim_eval})
 
     def fit(self):
         with logging_redirect_tqdm(loggers=[self.logger.logger]), tqdm(
@@ -327,6 +338,10 @@ class Trainer:
                     validation_interval = self.config.validation.update_interval
                     if updated and validation_interval and self.global_step % validation_interval == 0:
                         self._validate_and_log()
+                    sim = self.config.sim_eval
+                    if (updated and sim.enabled and self.global_step % sim.update_interval == 0
+                            and self.last_sim_eval_step != self.global_step):
+                        self._sim_evaluate_and_log()
                     stop_requested = ((config.max_updates is not None and self.global_step >= config.max_updates)
                                       or (config.num_steps is not None and self.global_step >= self.total_steps))
                     checkpoint_interval = self.config.checkpoint.update_interval
@@ -357,6 +372,8 @@ class Trainer:
             final_validation_due = finished and (validation.update_interval or validation.interval)
             if (epoch_validation_due or final_validation_due) and self.last_validation_step != self.global_step:
                 self._validate_and_log()
+            if finished and self.config.sim_eval.enabled and self.last_sim_eval_step != self.global_step:
+                self._sim_evaluate_and_log()
             if self.last_validation_step == self.global_step:
                 epoch_metrics.update(self.last_validation)
             self.logger.log(epoch_metrics)

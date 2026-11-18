@@ -51,6 +51,24 @@ external/simulation-simple/.venv/bin/awbc-eval-sim \
 
 评测使用新建的输出目录，写入 `rollouts.jsonl`、`summary.json` 和 `errors.jsonl`。异常会停止批次，已完成的结果仍可检查，汇总中的 `complete` 为 `false`，`success_rate` 为 `null`。
 
+### 训练中验证成功率
+
+Policy 配置支持 `sim_eval`，默认关闭。启用后，每到指定 optimizer update 次数，训练会暂停，保存 actor 快照并用仿真的 Python 子进程执行上述评测。训练结束时补评最终 step，恢复训练时沿用 checkpoint 中保存的最近评测步数。建议先在真实 MuJoCo 机器上确认独立评测可运行，再启用周期评测。
+
+```bash
+awbc-train --config configs/iql_dense_awbc.json \
+  --set dataset.root=/path/to/block_insertion_rgb_640x480_300_iql \
+  --set advantage_weighting.labels_path=/path/to/dense_critic/advantages.jsonl \
+  --set advantage_weighting.metadata_path=/path/to/dense_critic/advantages.metadata.json \
+  --set dense_awbc.progress_path=/path/to/boundary_progress_iql.jsonl \
+  --set sim_eval.enabled=true --set sim_eval.update_interval=5000 \
+  --set sim_eval.weights=ema --set sim_eval.episodes=20 \
+  --set sim_eval.seed=10000 --set sim_eval.noise_seed=20000 \
+  --set sim_eval.device=cuda --set sim_eval.max_control_ticks=2500
+```
+
+`sim_eval.python` 默认是 `external/simulation-simple/.venv/bin/python`，`sim_eval.timeout_seconds` 默认 3600。两者可用 `--set` 覆盖。评测输出在实验的 `sim_eval/step_XXXXXXXX/`，包含 `actor.pt`、子进程日志、`evaluation.json` 和 `results/`。日志记录 `sim/success_rate`、成功和完成条数、完整性及耗时。发生异常或子进程超时后，错误写入评测目录，训练继续，该次成功率记为 null。仿真环境的 episode 上限与评测 tick 预算同步设置，2500 个 100 Hz tick 对应最多 25 秒。每次使用固定 seed 序列，并记录仿真 commit、映射内容及 checkpoint 指纹。
+
 ## 项目结构
 
 ```text

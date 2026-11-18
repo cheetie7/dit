@@ -1,10 +1,12 @@
 """Evaluate a DiT actor synchronously in simulation-simple's block insertion task."""
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
 import sys
+import subprocess
 
 import numpy as np
 import torch
@@ -132,6 +134,7 @@ def main(argv=None):
     args.output_dir.mkdir(parents=True, exist_ok=False)
     records, errors = [], []
     frequency = None
+    mapping_json = None
     env = None
     try:
         stage = "load_policy"
@@ -143,6 +146,7 @@ def main(argv=None):
         frequency = resolve_action_fps(args.action_fps, policy.config.action_fps, dataset_info)
         stage = "environment_setup"
         env = create_environment(args.simulation_root, mapping)
+        env.max_episode_steps = args.max_control_ticks
         mapping.validate_environment(env)
         action_repeat(frequency, env.control_frequency_hz)
         for offset in range(args.episodes):
@@ -162,11 +166,16 @@ def main(argv=None):
                 errors.append(_error("environment_close", exception))
 
     summary = summarize_rollouts(records, errors, args.episodes)
+    revision = subprocess.run(["git", "-C", str(args.simulation_root), "rev-parse", "HEAD"],
+                              capture_output=True, text=True)
     summary.update(
         task="block_insertion", checkpoint=str(args.checkpoint.resolve()), weights=args.weights, device=args.device,
         mapping=str(args.mapping.resolve()), simulation_root=str(args.simulation_root.resolve()),
         dataset_root=str(args.dataset_root.resolve()) if args.dataset_root else None,
         action_fps=frequency, seed=args.seed, noise_seed=args.noise_seed, max_control_ticks=args.max_control_ticks,
+        simulation_commit=revision.stdout.strip() if revision.returncode == 0 else None,
+        mapping_content=mapping_json,
+        checkpoint_sha256=_file_sha256(args.checkpoint) if args.checkpoint.is_file() else None,
     )
     _write_jsonl(args.output_dir / "rollouts.jsonl", records)
     _write_jsonl(args.output_dir / "errors.jsonl", errors)
@@ -175,6 +184,14 @@ def main(argv=None):
         print(f"{error['stage']}: {error['type']}: {error['message']}", file=sys.stderr)
     print(json.dumps(summary, allow_nan=False))
     return 0 if summary["complete"] else 1
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 if __name__ == "__main__":

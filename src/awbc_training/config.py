@@ -119,6 +119,29 @@ class DenseAWBCConfig:
 
 
 @dataclass
+class SimEvalConfig:
+    enabled: bool = False
+    update_interval: int = 5000
+    weights: str = "ema"
+    python: str = "external/simulation-simple/.venv/bin/python"
+    simulation_root: str = "external/simulation-simple"
+    mapping: str = "configs/eval_sim_block_insertion.json"
+    device: str = "auto"
+    seed: int = 10000
+    noise_seed: int = 20000
+    episodes: int = 20
+    max_control_ticks: int = 2500
+    timeout_seconds: float = 3600
+
+    def __post_init__(self):
+        if self.enabled:
+            if self.update_interval <= 0 or self.episodes <= 0 or self.max_control_ticks <= 0 or self.timeout_seconds <= 0:
+                raise ValueError("sim_eval interval, episodes, tick budget and timeout must be positive")
+            if self.weights not in ("raw", "ema"):
+                raise ValueError("sim_eval.weights must be raw or ema")
+
+
+@dataclass
 class ExperimentConfig:
     experiment_name: str = "flow_matching_baseline"
     output_root: str = "outputs"
@@ -135,13 +158,15 @@ class ExperimentConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     advantage_weighting: AdvantageWeightingConfig = field(default_factory=AdvantageWeightingConfig)
     dense_awbc: DenseAWBCConfig = field(default_factory=DenseAWBCConfig)
+    sim_eval: SimEvalConfig = field(default_factory=SimEvalConfig)
 
     @classmethod
     def from_dict(cls, value):
         sections = {"dataset": DatasetConfig, "training": TrainingConfig, "optimizer": OptimizerConfig,
                     "scheduler": SchedulerConfig, "amp": AMPConfig, "ema": EMAConfig,
                     "validation": ValidationConfig, "checkpoint": CheckpointConfig, "logging": LoggingConfig,
-                    "advantage_weighting": AdvantageWeightingConfig, "dense_awbc": DenseAWBCConfig}
+                    "advantage_weighting": AdvantageWeightingConfig, "dense_awbc": DenseAWBCConfig,
+                    "sim_eval": SimEvalConfig}
         return cls(**{key: sections[key](**item) if key in sections else item for key, item in value.items()})
 
     @classmethod
