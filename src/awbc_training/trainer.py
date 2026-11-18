@@ -339,7 +339,8 @@ class Trainer:
                     if updated and validation_interval and self.global_step % validation_interval == 0:
                         self._validate_and_log()
                     sim = self.config.sim_eval
-                    if (updated and sim.enabled and self.global_step % sim.update_interval == 0
+                    if (updated and sim.enabled and self.global_step >= sim.start_step
+                            and (self.global_step - sim.start_step) % sim.update_interval == 0
                             and self.last_sim_eval_step != self.global_step):
                         self._sim_evaluate_and_log()
                     stop_requested = ((config.max_updates is not None and self.global_step >= config.max_updates)
@@ -372,7 +373,8 @@ class Trainer:
             final_validation_due = finished and (validation.update_interval or validation.interval)
             if (epoch_validation_due or final_validation_due) and self.last_validation_step != self.global_step:
                 self._validate_and_log()
-            if finished and self.config.sim_eval.enabled and self.last_sim_eval_step != self.global_step:
+            if (finished and self.config.sim_eval.enabled and self.global_step >= self.config.sim_eval.start_step
+                    and self.last_sim_eval_step != self.global_step):
                 self._sim_evaluate_and_log()
             if self.last_validation_step == self.global_step:
                 epoch_metrics.update(self.last_validation)

@@ -9,23 +9,7 @@
   "data": {
     "root": "/root/data/block_insertion_rgb_640x480_300_iql",
     "labels_path": "/root/data/block_insertion_rgb_640x480_300_iql/episode_end_labels.jsonl",
-    "progress_path": "/root/data/block_insertion_rgb_640x480_300_iql/boundary_progress_iql.jsonl",
-    "action_horizon": 10,
-    "dataset": {
-      "val_fraction": 0.1,
-      "split_seed": 42,
-      "stratify_key": "tasks",
-      "train_stride": 10,
-      "state_indices": [0, 1, 2, 3, 4, 5, 6, 28],
-      "action_indices": [0, 1, 2, 3, 4, 5, 6, 7]
-    }
-  },
-  "critic": {
-    "num_steps": 10000,
-    "batch_size": 16,
-    "device": "cuda",
-    "shaping_scale": 1.0,
-    "gamma": 0.99
+    "progress_path": "/root/data/block_insertion_rgb_640x480_300_iql/boundary_progress_iql.jsonl"
   },
   "policy": {
     "training": {
@@ -34,12 +18,15 @@
       "num_workers": 4,
       "device": "cuda"
     },
-    "dense_awbc": {
-      "robometer_decay_enabled": false,
-      "robometer_scale_start": 1.0
+    "advantage_weighting": {
+      "normalization": "none",
+      "beta": 1.0,
+      "min_weight": 0.1,
+      "max_weight": 10.0
     },
     "sim_eval": {
       "enabled": true,
+      "start_step": 10000,
       "update_interval": 5000,
       "weights": "ema",
       "simulation_root": "/root/code/simulation-simple",
@@ -50,5 +37,6 @@
       "max_control_ticks": 2500,
       "timeout_seconds": 3600
     }
-  }
+  },
+  "critic_checkpoint": "/root/outputs/dense_critic/checkpoints/latest_checkpoint.pt"
 }

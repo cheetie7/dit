@@ -1,4 +1,4 @@
-"""Prepare immutable run configs and execute dense critic -> export -> policy."""
+"""Export advantages from a sparse or dense IQL checkpoint, then train IQL-FM."""
 
 import argparse
 from copy import deepcopy
@@ -19,24 +19,21 @@ def merge(base, updates):
     return base
 
 
-def prepare_configs(settings, repo, run):
-    data = settings["data"]
-    dataset = {**data["dataset"], "root": data["root"]}
-    critic = merge(json.loads((repo / "configs/iql_dense_critic.json").read_text()), settings["critic"])
-    critic.update(dataset=dataset, labels_path=data["labels_path"], progress_path=data["progress_path"],
-                  action_horizon=data["action_horizon"])
-    policy = merge(json.loads((repo / "configs/iql_dense_awbc.json").read_text()), settings["policy"])
-    policy["dataset"] = deepcopy(dataset)
-    policy["policy"]["dit"]["action_horizon"] = data["action_horizon"]
-    policy["policy"]["n_action_steps"] = min(8, data["action_horizon"])
+def prepare_policy_config(settings, repo, run, critic):
+    policy = merge(json.loads((repo / "configs/iql_fm.json").read_text()), settings["policy"])
+    policy["training"]["objective"] = "iql_fm"
+    policy["dataset"] = deepcopy(critic["config"]["dataset"])
+    policy["dataset"]["root"] = settings["data"]["root"]
+    horizon = critic["model_config"]["action_horizon"]
+    policy["policy"]["dit"]["action_horizon"] = horizon
+    policy["policy"]["n_action_steps"] = min(8, horizon)
     policy["advantage_weighting"].update(
-        labels_path=str(run / "critic/advantages.jsonl"),
-        metadata_path=str(run / "critic/advantages.metadata.json"),
+        labels_path=str(run / "advantages.jsonl"),
+        metadata_path=str(run / "advantages.metadata.json"),
     )
-    policy["dense_awbc"]["progress_path"] = data["progress_path"]
     policy["sim_eval"]["python"] = settings["runtime"]["python"]
     policy["sim_eval"]["mapping"] = str(repo / "configs/eval_sim_block_insertion.json")
-    return critic, policy
+    return policy
 
 
 def main():
@@ -49,18 +46,27 @@ def main():
     run_id = f"{datetime.now():%Y%m%d-%H%M%S-%f}-job{os.environ.get('SLURM_JOB_ID', 'local')}"
     run = Path(runtime["output_root"]).resolve() / run_id
     run.mkdir(parents=True)
-    critic, policy = prepare_configs(settings, repo, run)
-    for name, values in (("server", settings), ("critic", critic), ("policy", policy)):
+    import torch
+
+    checkpoint = Path(settings["critic_checkpoint"]).resolve()
+    critic = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    mode = critic["data_contract"].get("reward_mode", "sparse")
+    module = {"sparse": "awbc_training.iql", "dense": "awbc_training.iql_dense"}[mode]
+    policy = prepare_policy_config(settings, repo, run, critic)
+    del critic
+    for name, values in (("server", settings), ("policy", policy)):
         (run / f"{name}.json").write_text(json.dumps(values, indent=2) + "\n")
     environment = os.environ.copy()
     environment["TORCH_HOME"] = runtime["pretrained_cache"]
     environment["MPLCONFIGDIR"] = str(run / "matplotlib")
+    export = [sys.executable, "-m", module, "export", "--checkpoint", str(checkpoint),
+              "--output", str(run / "advantages.jsonl"),
+              "--set", "dataset.root=" + settings["data"]["root"],
+              "--set", "labels_path=" + settings["data"]["labels_path"]]
+    if mode == "dense":
+        export.extend(["--set", "progress_path=" + settings["data"]["progress_path"]])
     commands = [
-        [sys.executable, "-m", "awbc_training.iql_dense", "train", "--config", str(run / "critic.json"),
-         "--run-dir", str(run / "critic")],
-        [sys.executable, "-m", "awbc_training.iql_dense", "export",
-         "--checkpoint", str(run / "critic/checkpoints/latest_checkpoint.pt"),
-         "--output", str(run / "critic/advantages.jsonl")],
+        export,
         [sys.executable, "-m", "awbc_training.train", "--config", str(run / "policy.json"),
          "--run-dir", str(run / "policy")],
     ]

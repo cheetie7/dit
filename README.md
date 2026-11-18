@@ -53,7 +53,7 @@ external/simulation-simple/.venv/bin/awbc-eval-sim \
 
 ### 训练中验证成功率
 
-Policy 配置支持 `sim_eval`，默认关闭。启用后，每到指定 optimizer update 次数，训练会暂停，保存 actor 快照并用仿真的 Python 子进程执行上述评测。训练结束时补评最终 step，恢复训练时沿用 checkpoint 中保存的最近评测步数。建议先在真实 MuJoCo 机器上确认独立评测可运行，再启用周期评测。
+Policy 配置支持 `sim_eval`，默认关闭。`sim_eval.start_step` 默认 0，指定首次仿真评测的 optimizer update 步数。例如设为 10000、`update_interval=5000`，则在 10000、15000、20000 步评测。训练结束时只有达到开始步数才补评最终 step，恢复训练时沿用 checkpoint 中保存的最近评测步数。评测时训练暂停，由仿真的 Python 子进程加载 actor 快照。建议先在真实 MuJoCo 机器上确认独立评测可运行，再启用周期评测。
 
 ```bash
 awbc-train --config configs/iql_dense_awbc.json \
@@ -82,9 +82,12 @@ hgpu-batch -g 1 -c 8 -m 32G -t 08:00:00 \
   train.sh
 ```
 
-`train.sh` 在分配到的节点通过 `srun` 启动配置中的已保存镜像，使用 `--container-remap-root --container-mount-home`。容器内直接使用已有的 `.venv-cu124`，顺序执行 Dense critic 训练、Advantage 导出和 Dense AWBC policy 训练。Policy 按配置周期启动同容器中的仿真子进程。任一步失败会停止后续阶段。
+`train.sh` 在分配到的节点通过 `srun` 启动配置中的镜像，使用 `--container-remap-root --container-mount-home`。容器内使用已有的 `.venv-cu124`，加载 `critic_checkpoint` 指定的 IQL checkpoint，按保存的 reward_mode 自动选择基础 IQL 或 Dense IQL 导出，再使用 `configs/iql_fm.json` 训练 policy。导出失败会停止任务。
 
-主要编辑位置为 `runtime.image`（登录节点镜像路径）、`runtime.repo/python/output_root`（容器内路径）、`data.root/labels_path/progress_path`、`critic.num_steps`、`policy.training.num_steps` 和 `policy.sim_eval`。当前示例为 critic 10000 步、policy 50000 步，每 5000 步评测 20 条轨迹。先验收时可改为两阶段各 3 步、batch 2、评测间隔 3、评测 2 条。每次提交创建独立输出目录并保存解析后的 `critic.json`、`policy.json` 和原始 `server.json`。
+直接编辑 `configs/server_train.json`。填写 `critic_checkpoint` 为已经训练完成的 Q/V checkpoint，支持 `iql_critic` 和 `iql_dense_critic` 两种来源。窗口长度、stride、状态和动作索引及数据划分沿用该 checkpoint。通过 `data.root`、`data.labels_path` 指定数据和终止标签位置。Dense critic 额外使用 `data.progress_path`，基础 critic 无需进度文件。导出会核对来源指纹与 checkpoint 是否一致。Policy 直接使用 Q−V 权重，配置项在 `policy.advantage_weighting`。
+
+`policy.training.num_steps` 控制 BC 训练次数。`policy.sim_eval.start_step=10000` 表示从第 10000 次 policy 更新开始仿真评测，之后每隔 `update_interval` 步评测。每次提交创建独立输出目录，保存 `server.json`、`policy.json`、`advantages.jsonl` 和对应 metadata，actor checkpoint 及评测结果写入 `policy/`。
+
 
 ## 项目结构
 

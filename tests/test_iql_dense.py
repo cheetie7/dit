@@ -178,7 +178,11 @@ def test_dense_cli_checkpoint_and_iql_fm_export(root, tmp_path):
     dense_main(["train", "--resume", str(checkpoint), "--set", "num_steps=2"])
     assert torch.load(checkpoint, weights_only=False)["global_step"] == 2
     output = run / "advantages.jsonl"
-    dense_main(["export", "--checkpoint", str(checkpoint), "--output", str(output)])
+    saved = torch.load(checkpoint, weights_only=False)
+    saved["config"]["dataset"]["root"] = "/previous/machine/dataset"
+    torch.save(saved, checkpoint)
+    dense_main(["export", "--checkpoint", str(checkpoint), "--output", str(output),
+                "--set", f"dataset.root={root}"])
     metadata_path = output.with_suffix(".metadata.json")
     assert json.loads(metadata_path.read_text())["data_contract"]["reward_mode"] == "dense"
     train, _, _, split = prepare_datasets(

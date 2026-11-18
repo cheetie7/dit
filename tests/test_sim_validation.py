@@ -27,12 +27,14 @@ def test_schedules_after_updates_and_resumes_without_duplicates(tmp_path, monkey
 
     monkeypatch.setattr("awbc_training.trainer.evaluate_snapshot", evaluate)
     first = enable(trainer(tmp_path, "first", num_steps=4, max_updates=2))
+    first.config.sim_eval.start_step = 2
     first.fit()
     checkpoint = first.directory / "checkpoints/latest_checkpoint.pt"
     state = torch.load(checkpoint, weights_only=False)
     first.logger.close()
     assert state["last_sim_eval_step"] == 2 and calls == [(2, 2)]
     resumed = enable(trainer(tmp_path, "resumed", num_steps=4, max_updates=4, state=state))
+    resumed.config.sim_eval.start_step = 2
     resumed.fit()
     resumed.logger.close()
     assert calls == [(2, 2), (4, 4)]
@@ -52,6 +54,22 @@ def test_final_step_runs_once_without_changing_training(tmp_path, monkeypatch):
         torch.testing.assert_close(parameter, evaluated.policy.state_dict()[key], rtol=0, atol=0)
     for run in (plain, evaluated):
         run.logger.close()
+
+
+@pytest.mark.parametrize(("start", "expected"), [(2, [2, 4, 5]), (6, [])])
+def test_optional_start_step_and_final_evaluation(tmp_path, monkeypatch, start, expected):
+    calls = []
+
+    def evaluate(run):
+        calls.append(run.global_step)
+        return {"sim/complete": True, "sim/success_rate": 0.5}
+
+    monkeypatch.setattr("awbc_training.trainer.evaluate_snapshot", evaluate)
+    run = enable(trainer(tmp_path, "delayed", num_steps=5, max_updates=5))
+    run.config.sim_eval.start_step = start
+    run.fit()
+    run.logger.close()
+    assert calls == expected
 
 
 @pytest.mark.parametrize("failure", [None, "timeout", "incomplete"])

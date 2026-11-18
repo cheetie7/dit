@@ -121,6 +121,7 @@ class DenseAWBCConfig:
 @dataclass
 class SimEvalConfig:
     enabled: bool = False
+    start_step: int = 0
     update_interval: int = 5000
     weights: str = "ema"
     python: str = "external/simulation-simple/.venv/bin/python"
@@ -134,6 +135,8 @@ class SimEvalConfig:
     timeout_seconds: float = 3600
 
     def __post_init__(self):
+        if self.start_step < 0:
+            raise ValueError("sim_eval.start_step must be nonnegative")
         if self.enabled:
             if self.update_interval <= 0 or self.episodes <= 0 or self.max_control_ticks <= 0 or self.timeout_seconds <= 0:
                 raise ValueError("sim_eval interval, episodes, tick budget and timeout must be positive")

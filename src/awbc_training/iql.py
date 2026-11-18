@@ -316,7 +316,7 @@ def _train(config, directory, state):
 
 
 @torch.no_grad()
-def export_advantages(checkpoint, output, device=None, *, config_type=IQLConfig):
+def export_advantages(checkpoint, output, device=None, *, config_type=IQLConfig, overrides=()):
     checkpoint, output = Path(checkpoint), Path(output)
     metadata_path = output.with_suffix(".metadata.json")
     if checkpoint.resolve() in (output.resolve(), metadata_path.resolve()):
@@ -324,7 +324,7 @@ def export_advantages(checkpoint, output, device=None, *, config_type=IQLConfig)
     checkpoint_hash = _sha256(checkpoint)
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     _check_reward_mode(state, config_type.reward_mode)
-    config = config_type.from_dict(state["config"])
+    config = config_type.from_dict(apply_overrides(deepcopy(state["config"]), overrides))
     train, _, stats, split, contract, model_config = _prepare(config)
     _check_data(state, stats, split, contract, model_config)
     device = resolve_device(device or config.device)
@@ -386,9 +386,11 @@ def main(argv=None, *, config_type=IQLConfig, default_config="configs/iql_critic
     export.add_argument("--checkpoint", type=Path, required=True)
     export.add_argument("--output", type=Path, required=True)
     export.add_argument("--device")
+    export.add_argument("--set", dest="overrides", action="append", default=[])
     args = parser.parse_args(argv)
     if args.command == "export":
-        metadata = export_advantages(args.checkpoint, args.output, args.device, config_type=config_type)
+        metadata = export_advantages(args.checkpoint, args.output, args.device,
+                                     config_type=config_type, overrides=args.overrides)
         print(f"Exported {metadata['record_count']} windows to {args.output}")
         return
     state = torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
