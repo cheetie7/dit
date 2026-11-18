@@ -1,0 +1,54 @@
+{
+  "runtime": {
+    "image": "~/_images/simulation-simple-cu124.sqsh",
+    "repo": "/root/code/dit",
+    "python": "/root/code/simulation-simple/.venv-cu124/bin/python",
+    "output_root": "/root/outputs/dit",
+    "pretrained_cache": "/root/.cache/torch"
+  },
+  "data": {
+    "root": "/root/data/block_insertion_rgb_640x480_300_iql",
+    "labels_path": "/root/data/block_insertion_rgb_640x480_300_iql/episode_end_labels.jsonl",
+    "progress_path": "/root/data/block_insertion_rgb_640x480_300_iql/boundary_progress_iql.jsonl",
+    "action_horizon": 10,
+    "dataset": {
+      "val_fraction": 0.1,
+      "split_seed": 42,
+      "stratify_key": "tasks",
+      "train_stride": 10,
+      "state_indices": [0, 1, 2, 3, 4, 5, 6, 28],
+      "action_indices": [0, 1, 2, 3, 4, 5, 6, 7]
+    }
+  },
+  "critic": {
+    "num_steps": 10000,
+    "batch_size": 16,
+    "device": "cuda",
+    "shaping_scale": 1.0,
+    "gamma": 0.99
+  },
+  "policy": {
+    "training": {
+      "num_steps": 50000,
+      "batch_size": 16,
+      "num_workers": 4,
+      "device": "cuda"
+    },
+    "dense_awbc": {
+      "robometer_decay_enabled": false,
+      "robometer_scale_start": 1.0
+    },
+    "sim_eval": {
+      "enabled": true,
+      "update_interval": 5000,
+      "weights": "ema",
+      "simulation_root": "/root/code/simulation-simple",
+      "device": "cuda",
+      "episodes": 20,
+      "seed": 10000,
+      "noise_seed": 20000,
+      "max_control_ticks": 2500,
+      "timeout_seconds": 3600
+    }
+  }
+}

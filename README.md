@@ -69,6 +69,23 @@ awbc-train --config configs/iql_dense_awbc.json \
 
 `sim_eval.python` 默认是 `external/simulation-simple/.venv/bin/python`，`sim_eval.timeout_seconds` 默认 3600。两者可用 `--set` 覆盖。评测输出在实验的 `sim_eval/step_XXXXXXXX/`，包含 `actor.pt`、子进程日志、`evaluation.json` 和 `results/`。日志记录 `sim/success_rate`、成功和完成条数、完整性及耗时。发生异常或子进程超时后，错误写入评测目录，训练继续，该次成功率记为 null。仿真环境的 episode 上限与评测 tick 预算同步设置，2500 个 100 Hz tick 对应最多 25 秒。每次使用固定 seed 序列，并记录仿真 commit、映射内容及 checkpoint 指纹。
 
+### Slurm / Pyxis 服务器一键训练
+
+服务器部署时将 DiT 放在家目录的 `code/dit`，挂载到容器后对应 `/root/code/dit`。编辑 `configs/server_train.json` 集中设置镜像、Python、数据路径、训练步数和评测频率。`data.dataset` 中的状态、动作索引及 stride 同时用于 critic 和 policy，`data.action_horizon` 同时设置两者的窗口长度。数据、终止标签和进度文件需要在配置指定的位置可读。
+
+```bash
+mkdir -p ~/logs
+cd ~/code/dit
+hgpu-batch -g 1 -c 8 -m 32G -t 08:00:00 \
+  -o ~/logs/%x-%j.out \
+  -e ~/logs/%x-%j.err \
+  train.sh
+```
+
+`train.sh` 在分配到的节点通过 `srun` 启动配置中的已保存镜像，使用 `--container-remap-root --container-mount-home`。容器内直接使用已有的 `.venv-cu124`，顺序执行 Dense critic 训练、Advantage 导出和 Dense AWBC policy 训练。Policy 按配置周期启动同容器中的仿真子进程。任一步失败会停止后续阶段。
+
+主要编辑位置为 `runtime.image`（登录节点镜像路径）、`runtime.repo/python/output_root`（容器内路径）、`data.root/labels_path/progress_path`、`critic.num_steps`、`policy.training.num_steps` 和 `policy.sim_eval`。当前示例为 critic 10000 步、policy 50000 步，每 5000 步评测 20 条轨迹。先验收时可改为两阶段各 3 步、batch 2、评测间隔 3、评测 2 条。每次提交创建独立输出目录并保存解析后的 `critic.json`、`policy.json` 和原始 `server.json`。
+
 ## 项目结构
 
 ```text
