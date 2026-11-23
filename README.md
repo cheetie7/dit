@@ -1,226 +1,430 @@
 # DiT Flow Policy
 
-用于离线机器人示教的独立 PyTorch 项目：ResNet-18 → Observation Transformer → Conditional DiT，支持普通 Flow Matching（FM）和 Advantage-Weighted Flow Matching（AWR-FM）。默认预测 **10 步动作块**，执行长度单独配置为 8；不依赖 LeRobot Python 包、机器人 SDK 或 RoboMeter 在线模型。
+使用共享 ResNet-18、Observation Transformer 和 Conditional DiT 学习机器人动作块，支持普通 Flow Matching、RoboMeter Advantage 加权及 IQL critic 导出的 Q−V 加权。
 
-## 安装
+推荐流程是先独立训练 Q/V critic，导出训练窗口的 Advantage，再训练 DiT policy。已有 critic checkpoint 时，从 Advantage 导出开始即可。
 
-推荐 Python 3.12，支持 Python ≥3.10。先按目标设备安装匹配的 PyTorch / torchvision，再安装项目：
+## 1. 安装训练环境
 
-```bash
-python -m venv .venv
+项目支持 Python ≥3.10，纯训练建议 Python 3.12。需要加载 simulation-simple 时使用 Python 3.11。GPU 训练应先安装与本机驱动、CUDA 环境匹配的 PyTorch 和 torchvision，再安装项目。
+
+~~~bash
+git clone https://github.com/cheetie7/dit.git
+cd dit
+
+python3.12 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
-# 可选的 WandB 日志
+
+python -c 'import torch; print(torch.__version__); print("CUDA:", torch.cuda.is_available()); print("MPS:", torch.backends.mps.is_available())'
+awbc-train --help
+python -m awbc_training.iql --help
+python -m awbc_training.iql_dense --help
+awbc-eval-sim --help
+pytest -q
+~~~
+
+CPU 可运行数据检查和合成测试，pytest 无需 MuJoCo。首次使用预训练 ResNet-18 会下载 ImageNet 权重，可显式指定缓存目录。WandB 是可选依赖。
+
+~~~bash
+export TORCH_HOME="$PWD/artifacts/torch"
 python -m pip install -e '.[wandb]'
-```
+~~~
 
-本机验证版本：Python 3.12、PyTorch 2.11.0、torchvision 0.26.0。CUDA、MPS 或 CPU 由 training.device 配置；GPU 上的 AMP 支持以运行时检查为准。
+后续命令默认从 DiT 根目录执行，且已经激活训练环境。配置中的相对路径相对于命令运行目录，实际数据建议使用绝对路径。新实验的输出目录必须尚不存在。
 
-## 仿真环境
+## 2. 配置与入口
 
-私有仓库 [Songan-Lab/simulation-simple](https://github.com/Songan-Lab/simulation-simple.git) 的本地入口固定为 `external/simulation-simple`。在 DiT 仓库根目录检查 GitHub CLI 登录和仓库读取权限。未登录时运行 `gh auth login --hostname github.com --git-protocol https --web`，按浏览器提示完成认证。
+| 配置 | 用途 | 入口 |
+|---|---|---|
+| configs/fm.json | 普通 FM policy | awbc-train |
+| configs/awr_fm.json | RoboMeter Advantage 加权 policy | awbc-train |
+| configs/iql_critic.json | 稀疏成功奖励 Q/V critic | python -m awbc_training.iql train |
+| configs/iql_dense_critic.json | 进度塑形奖励 Q/V critic | python -m awbc_training.iql_dense train |
+| configs/iql_fm.json | 用 sparse/dense critic 的 Q−V 加权 policy | awbc-train |
+| configs/iql_dense_awbc.json | 融合 Dense critic 与 RoboMeter 两路权重 | awbc-train |
+| configs/eval_sim_block_insertion.json | 仿真映射 | awbc-eval-sim |
+| configs/smoke.json、overfit.json | 小规模诊断 | awbc-train |
 
-```bash
+直接编辑 JSON，或通过多次 --set key=value 覆盖。数字、列表、布尔值和 null 按 JSON 解析。Critic 使用顶层 num_steps，policy 使用 training.num_steps，均表示成功的 optimizer update 次数。梯度累积的多个 microbatch 合计一次 policy 更新。Policy 指定 num_steps 后优先于 num_epochs。
+
+## 3. 准备数据与标签
+
+输入为 LeRobot v3.0 Parquet 数值列和时间戳对齐的 RGB MP4。数据、终止标签、RoboMeter 评分和模型权重由调用方准备。
+
+~~~text
+dataset/
+├── meta/
+│   ├── info.json
+│   └── episodes/**/*.parquet
+├── data/**/*.parquet
+├── videos/**/*.mp4
+├── episode_end_labels.jsonl
+└── boundary_progress_iql.jsonl
+~~~
+
+训练入口按完整轨迹划分 train/val，状态和动作的 min-max 统计只从训练轨迹计算。图像按配置 resize 或 letterbox，使用 ImageNet mean/std。验证与推理复用训练统计。
+
+### 状态、动作和窗口
+
+当前 iql_critic、iql_dense_critic、iql_dense_awbc 配置选择本项目 block insertion 数据中的左臂七个关节角及夹爪状态，动作选择左臂七个关节命令及夹爪命令。
+
+~~~json
+{
+  "dataset": {
+    "state_indices": [0, 1, 2, 3, 4, 5, 6, 28],
+    "action_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "train_stride": 10
+  }
+}
+~~~
+
+索引依据该数据集 meta/info.json 的原始 44 维状态和 16 维动作顺序。其他机器人需按各自字段定义配置。列表顺序会保留，省略或设为 null 时使用完整列。模型维度自动匹配切片结果。
+
+iql_fm.json 默认使用完整状态和动作，消费左臂 critic 标签时也要填写上述索引。
+
+Critic 的 action_horizon 和 policy 的 policy.dit.action_horizon 定义窗口名义长度 H。dataset.train_stride 定义训练起点间隔，null 时等于 H。验证 stride 等于 H。起点 t、有效长度 L 的样本使用动作 [t,t+L)，下一观测是同一轨迹 t+L 帧。短尾块补齐到 H，padding 不参与 loss。
+
+### 终止标签
+
+IQL 需要 episode_end_labels.jsonl，每条轨迹一行。
+
+~~~json
+{"episode_index": 12, "success": true, "end_type": "terminated", "end_frame_index": 347}
+~~~
+
+end_type 为 terminated 或 truncated。episode_index 使用保存后的 ID，采集 seed 可能与其不同。数据约定 N 帧包含 N−1 个有效 transition；end_frame_index 必须是最后有效动作执行后的第 N−1 帧。成功终止的最后一个有效动作给 +1，折算到窗口起点为 gamma 的 L−1 次方。真正终止时 bootstrap_mask=0，有有效下一观测的截断为 1。
+
+本地曾对 300 条仿真轨迹补入复制末帧，补丁版为 60,509 帧和 60,209 个有效动作。该补丁数据是独立准备的产物，需连同终止标签一起使用。使用其他原始导出时，先核实末动作后的观测语义。
+
+### 原始进度标签
+
+Dense IQL 和 Dense AWBC 读取 boundary_progress_iql.jsonl。
+
+~~~json
+{"episode_index": 12, "relative_frame_index": 0, "progress_raw": 0.2}
+{"episode_index": 12, "relative_frame_index": 20, "progress_raw": 0.6}
+{"episode_index": 12, "relative_frame_index": 347, "progress_raw": 0.78}
+~~~
+
+按 episode_index 和 relative_frame_index 对应数据的 episode_index、frame_index。使用 progress_raw，保留实际末帧分数。旧评分中的 progress_used 可能把终点强制设为 1，Dense 路径读取原始值。
+
+每条轨迹必须覆盖首末帧，相邻评分之间按帧号线性插值，允许下降。原始标签间隔 20 帧与训练 horizon、stride 独立。复制出来的末帧应显式增加同一观测的原始分数。已有补丁数据的 boundary_progress_iql.jsonl 已补齐；缺失边界、重复键、非有限值和越界帧都会报错。
+
+Dense critic 的数据奖励和 TD target 为：
+
+~~~text
+reward_dense = gamma * progress(t+L) - progress(t)
+reward = reward_sparse + shaping_scale * reward_dense
+discount = gamma ** L
+TD target = reward + discount * bootstrap_mask * V(next_observation)
+~~~
+
+Dense 项使用固定 gamma，bootstrap 折扣使用实际有效长度 L。原始 RoboMeter 评分工具和额外依赖见 [标注工具说明](tools/labeling/README.md)。训练使用预先计算好的标签文件。
+
+## 4. 独立训练 critic
+
+设置实际数据路径和新输出目录。下面 sparse 和 dense 两种训练选择一种执行。
+
+~~~bash
+data=/absolute/path/to/block_insertion_rgb_640x480_300_iql
+mkdir -p outputs
+
+test -f "$data/meta/info.json"
+test -f "$data/episode_end_labels.jsonl"
+~~~
+
+基础 IQL 使用稀疏成功奖励。
+
+~~~bash
+critic_run="$PWD/outputs/critic_left_run1"
+
+python -m awbc_training.iql train \
+  --config configs/iql_critic.json \
+  --set dataset.root="$data" \
+  --set labels_path="$data/episode_end_labels.jsonl" \
+  --set device=cuda \
+  --run-dir "$critic_run"
+~~~
+
+Dense IQL 增加原始进度塑形奖励。
+
+~~~bash
+critic_run="$PWD/outputs/dense_critic_left_run1"
+
+python -m awbc_training.iql_dense train \
+  --config configs/iql_dense_critic.json \
+  --set dataset.root="$data" \
+  --set labels_path="$data/episode_end_labels.jsonl" \
+  --set progress_path="$data/boundary_progress_iql.jsonl" \
+  --set device=cuda \
+  --run-dir "$critic_run"
+~~~
+
+默认 10000 次更新、batch 16。CPU 设置 device=cpu。需要 stride=2 时增加 --set dataset.train_stride=2。训练步数及保留 checkpoint 数量可直接编辑 critic JSON，例如：
+
+~~~json
+{
+  "num_steps": 5000,
+  "batch_size": 16,
+  "checkpoint_interval": 1000,
+  "checkpoint_keep_last_n": 5
+}
+~~~
+
+checkpoints/ 下保存 latest_checkpoint.pt 和最近指定数量的 step_XXXXXXXX.pt，训练结束时也保存。可使用某个中间 checkpoint 导出 Advantage。首次小规模验收可设置 num_steps=3、batch_size=2、validation_interval=3；无预训练缓存时可设 pretrained=false。
+
+## 5. 从已有 checkpoint 导出 Advantage
+
+使用与 critic 奖励模式对应的模块。仅遍历 checkpoint 所对应的训练窗口，输出原始 min(target_q1,target_q2)−V，保留正负值。
+
+~~~bash
+checkpoint="$critic_run/checkpoints/latest_checkpoint.pt"
+
+# 基础 IQL checkpoint
+python -m awbc_training.iql export \
+  --checkpoint "$checkpoint" --output "$critic_run/advantages.jsonl" --device cuda
+~~~
+
+Dense IQL checkpoint 则执行：
+
+~~~bash
+python -m awbc_training.iql_dense export \
+  --checkpoint "$checkpoint" --output "$critic_run/advantages.jsonl" --device cuda
+~~~
+
+若 checkpoint 保存了旧数据路径，可覆盖路径，继续读取同一份数据和标签。
+
+~~~bash
+python -m awbc_training.iql_dense export \
+  --checkpoint "$checkpoint" --output "$critic_run/advantages.jsonl" --device cuda \
+  --set dataset.root="$data" \
+  --set labels_path="$data/episode_end_labels.jsonl" \
+  --set progress_path="$data/boundary_progress_iql.jsonl"
+~~~
+
+产物为 advantages.jsonl、advantages.metadata.json。Metadata 保存 critic 标识、数据划分、奖励来源、horizon、stride、状态和动作选择，policy 加载时会核对。
+
+## 6. 训练 IQL-FM policy
+
+Sparse 和 Dense critic 的标签都可接入 iql_fm.json。下面配置与前述单左臂 critic 的 H=10、stride=10 一致。
+
+~~~bash
+actor_run="$PWD/outputs/iql_fm_left_run1"
+
+awbc-train --config configs/iql_fm.json \
+  --set dataset.root="$data" \
+  --set 'dataset.state_indices=[0,1,2,3,4,5,6,28]' \
+  --set 'dataset.action_indices=[0,1,2,3,4,5,6,7]' \
+  --set dataset.train_stride=10 \
+  --set policy.dit.action_horizon=10 \
+  --set advantage_weighting.labels_path="$critic_run/advantages.jsonl" \
+  --set advantage_weighting.metadata_path="$critic_run/advantages.metadata.json" \
+  --set training.device=cuda \
+  --set training.num_steps=10000 \
+  --run-dir "$actor_run"
+~~~
+
+如果 critic 使用其他 horizon、stride 或列选择，上面也需保持一致。验证使用普通 FM loss，标签只需覆盖训练窗口。
+
+IQL-FM 的默认权重配置为 normalization=none、beta=1、min_weight=0.1、max_weight=10。每个窗口使用 exp(A/beta) 并裁剪，按一次 optimizer update 全部样本的总权重归一化，梯度累积共享总分母。
+
+希望启动命令简短时，将参数写入独立 JSON。
+
+~~~bash
+cp configs/iql_fm.json configs/iql_fm.local.json
+# 编辑数据路径、列索引、窗口、标签路径和 training.num_steps
+awbc-train --config configs/iql_fm.local.json
+~~~
+
+configs/*.local.json 由 Git 忽略。修改既有配置即可使用，不需要修改训练源码。
+
+当前 policy 默认预测 10 步、执行前 8 步。policy.n_action_steps 控制执行块长度，想一次执行全部预测动作可设为 horizon。动作先在归一化空间生成，再按 checkpoint 中保存的动作统计反归一化。
+
+| Policy 字段 | 用途 |
+|---|---|
+| training.num_steps | 总更新预算，优先于 num_epochs |
+| training.batch_size | 每个 microbatch 的样本数 |
+| training.gradient_accumulation_steps | 每次更新累积多少个 microbatch |
+| validation.update_interval | 普通 FM 验证间隔 |
+| checkpoint.update_interval | checkpoint 保存间隔 |
+| checkpoint.keep_last_n | 保留最近多少个定期文件 |
+| logging.use_wandb / wandb_mode | 是否启用 WandB 及 online/offline 模式 |
+
+### 其他 policy 模式
+
+~~~bash
+awbc-train --config configs/fm.json \
+  --set dataset.root="$data" --set training.device=cuda
+~~~
+
+普通 FM 可以直接读取数据，状态/动作默认使用完整维度。awr_fm.json 使用已算好的 RoboMeter chunk Advantage，支持 Parquet annotation 或外部标签及其来源信息，见 [数据说明](docs/DATA.md)。
+
+iql_dense_awbc.json 读取 Dense critic 标签，并额外融合原始无折扣进度差。设置 advantage_weighting.labels_path、metadata_path 和 dense_awbc.progress_path。默认固定 RoboMeter scale=1，关闭衰减；scale_start=0 为纯 critic 对照。该模式 critic 权重为 exp(min(beta_q*A, log(critic_weight_cap)))，其中 beta_q 乘在 A 上，IQL-FM 则使用 A/beta。
+
+## 7. 结果与断点恢复
+
+~~~text
+<actor_run>/
+├── config.json / policy_config.json
+├── normalization_stats.json / split.json
+├── advantage_provenance.json / advantage_stats.json
+├── metrics.jsonl / metrics.csv / train.log
+├── advantage_analysis/
+├── checkpoints/
+│   ├── latest_checkpoint.pt
+│   └── step_XXXXXXXX.pt
+└── sim_eval/                         # 启用仿真验证时生成
+~~~
+
+恢复 policy 会沿用原输出目录及 optimizer、scheduler、EMA、随机状态、数据位置。
+
+~~~bash
+awbc-train --resume "$actor_run/checkpoints/latest_checkpoint.pt"
+~~~
+
+恢复 Dense critic：
+
+~~~bash
+python -m awbc_training.iql_dense train \
+  --resume "$critic_run/checkpoints/latest_checkpoint.pt"
+~~~
+
+基础 critic 使用 awbc_training.iql。Policy 同一次恢复需保持原总训练预算、batch 和梯度累积设置。窗口、状态/动作选择、数据划分或标签版本变化时启动新实验。恢复和推理直接使用 checkpoint 的视觉权重与统计。
+
+## 8. 配置可选仿真环境
+
+仿真使用私有仓库 [Songan-Lab/simulation-simple](https://github.com/Songan-Lab/simulation-simple)，需要 Python 3.11 和 uv。先安装 GitHub CLI，用具有读取权限的账号登录。
+
+~~~bash
 gh auth status --hostname github.com
+# 未登录时执行
+gh auth login --hostname github.com --git-protocol https --web
 gh repo view Songan-Lab/simulation-simple
+
 mkdir -p external
-gh repo clone Songan-Lab/simulation-simple external/simulation-simple &&
+gh repo clone Songan-Lab/simulation-simple external/simulation-simple
 git -C external/simulation-simple submodule update --init --recursive
-```
+~~~
 
-如果目标目录已有 checkout，先确认其 `origin` 指向上述仓库，再复用目录并初始化子模块。仿真 checkout 由自己的 Git 仓库管理。仿真环境使用该仓库的 Python 3.11、`uv.lock` 和 `.venv`。DiT 继续使用上面配置的训练环境。
+已有目录先核对 origin，再复用 checkout。external/simulation-simple 由 .gitignore 忽略，仿真仓库维护自己的版本和 mujoco_menagerie 子模块。
 
-### 独立仿真评测
+如果尚未安装 uv，可使用其安装脚本；重新打开终端或将安装目录加入 PATH 后，再检查版本。
 
-在支持 MuJoCo 渲染的机器上，从 DiT 根目录把评测入口安装到仿真的 Python 3.11 环境。下面以单左臂的 block insertion checkpoint 为例。Linux 无显示器时可在评测命令前设置 `MUJOCO_GL=egl`。
+~~~bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+~~~
 
-```bash
+在支持 MuJoCo 渲染的机器上执行：
+
+~~~bash
+uv python install 3.11
 uv sync --project external/simulation-simple --locked
 uv pip install --python external/simulation-simple/.venv/bin/python --no-deps -e .
-external/simulation-simple/.venv/bin/awbc-eval-sim \
-  --checkpoint /path/to/actor/checkpoints/latest_checkpoint.pt --weights ema --device auto \
-  --dataset-root /path/to/block_insertion_rgb_640x480_300_iql \
+
+sim_python="$PWD/external/simulation-simple/.venv/bin/python"
+"$sim_python" -c 'import torch, torchvision, av, pyarrow, mujoco; print(torch.__version__, torchvision.__version__, mujoco.__version__)'
+"$sim_python" -m awbc_training.eval_sim --help
+~~~
+
+仿真环境需要能够导入 DiT 训练依赖。使用独立的已有环境时，将 sim_python 及评测配置的 python、simulation_root 改成实际位置。
+
+Linux NVIDIA EGL 渲染需要驱动和 EGL/OpenGL 库。例如 Ubuntu：
+
+~~~bash
+sudo apt-get update
+sudo apt-get install -y build-essential linux-libc-dev git curl ca-certificates   ffmpeg libegl1 libgl1 libopengl0
+
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+~~~
+
+## 9. 独立评测策略成功率
+
+在同一 shell 中设置 data、actor_run、sim_python 后执行：
+
+~~~bash
+"$sim_python" -m awbc_training.eval_sim \
+  --checkpoint "$actor_run/checkpoints/latest_checkpoint.pt" \
+  --weights ema --device cuda \
+  --dataset-root "$data" \
   --mapping configs/eval_sim_block_insertion.json \
-  --seed 42 --noise-seed 1234 --episodes 10 --max-control-ticks 2500 \
-  --output-dir outputs/block_insertion_eval
-```
+  --simulation-root external/simulation-simple \
+  --seed 10000 --noise-seed 20000 --episodes 20 \
+  --max-control-ticks 2500 \
+  --output-dir "$actor_run/eval_20"
+~~~
 
-`--weights raw` 加载普通权重。映射文件的 `camera_map` 从 checkpoint 相机键映射到仿真的 RGB 字段，`image_size` 是原始渲染的 `[height, width]`。示例使用 LeRobot v3 导出的状态顺序 `joint_pos`、`joint_vel`、`gripper_pos`、`ee_pos`、`ee_quat`，各字段内左臂在前。位置和速度的关节单位分别为弧度和弧度每秒，夹爪状态是驱动关节角（弧度），末端位置是米，四元数顺序为 WXYZ。动作是绝对位置目标，关节用弧度，夹爪用仿真的 actuator coordinate。其他训练布局可用有序的 `state_names` 和 `action_names` 指定训练元数据的原始列名，并将 `controlled_arms` 与 checkpoint 所选动作列对应。当前左臂映射在 reset 后保存右臂的控制目标，整条轨迹复用该目标。
+weights=raw 加载普通权重，ema 加载 EMA。每次评测用新输出目录。
 
-提供 `--dataset-root` 时会核对 `meta/info.json` 的字段、相机分辨率和动作频率。旧 checkpoint 缺少频率时，可提供 `--dataset-root` 或显式传 `--action-fps 25`。100 Hz 仿真控制对应每个 25 Hz 动作保持 4 个 tick。每条轨迹独立记录环境和推理噪声 seed，两者按 episode 序号递增。
+映射文件明确相机对应关系、原始状态顺序和动作语义，维度仅用于校验。默认适配本项目原始 44 维状态、16 维动作及单左臂控制。原始状态依次拼接 joint_pos、joint_vel、gripper_pos、ee_pos、ee_quat，各字段内部左臂在前。关节角用弧度、速度用弧度每秒，夹爪状态是驱动关节角；末端位置用米，四元数为 WXYZ。动作是绝对位置目标，关节用弧度，夹爪用 actuator coordinate。
 
-评测使用新建的输出目录，写入 `rollouts.jsonl`、`summary.json` 和 `errors.jsonl`。异常会停止批次，已完成的结果仍可检查，汇总中的 `complete` 为 `false`，`success_rate` 为 `null`。
+默认相机为 eye、left_wrist、right_wrist 的 640×480 uint8 RGB。推理接收完整原始状态，由 checkpoint 切片并归一化，反归一化动作写入选定臂，另一臂保持 reset 后的控制目标。
 
-### 训练中验证成功率
+动作频率来自 checkpoint 或 meta/info.json，也可显式 --action-fps 25。100 Hz 控制对 25 Hz 动作，每个动作保持 4 个 tick。每 tick 检查成功、终止、截断和预算。2500 tick 为最多 25 秒，1500 tick 为 15 秒。
 
-Policy 配置支持 `sim_eval`，默认关闭。`sim_eval.start_step` 默认 0，指定首次仿真评测的 optimizer update 步数。例如设为 10000、`update_interval=5000`，则在 10000、15000、20000 步评测。训练结束时只有达到开始步数才补评最终 step，恢复训练时沿用 checkpoint 中保存的最近评测步数。评测时训练暂停，由仿真的 Python 子进程加载 actor 快照。建议先在真实 MuJoCo 机器上确认独立评测可运行，再启用周期评测。
+输出 rollouts.jsonl、summary.json 和 errors.jsonl。成功取环境 info.success。异常时 complete=false、success_rate=null，保留已完成记录。当前本地评测验收使用假环境；真实 MuJoCo 闭环和任务成功率需在可渲染机器上确认。
 
-```bash
-awbc-train --config configs/iql_dense_awbc.json \
-  --set dataset.root=/path/to/block_insertion_rgb_640x480_300_iql \
-  --set advantage_weighting.labels_path=/path/to/dense_critic/advantages.jsonl \
-  --set advantage_weighting.metadata_path=/path/to/dense_critic/advantages.metadata.json \
-  --set dense_awbc.progress_path=/path/to/boundary_progress_iql.jsonl \
-  --set sim_eval.enabled=true --set sim_eval.update_interval=5000 \
-  --set sim_eval.weights=ema --set sim_eval.episodes=20 \
-  --set sim_eval.seed=10000 --set sim_eval.noise_seed=20000 \
-  --set sim_eval.device=cuda --set sim_eval.max_control_ticks=2500
-```
+## 10. 训练中验证成功率
 
-`sim_eval.python` 默认是 `external/simulation-simple/.venv/bin/python`，`sim_eval.timeout_seconds` 默认 3600。两者可用 `--set` 覆盖。评测输出在实验的 `sim_eval/step_XXXXXXXX/`，包含 `actor.pt`、子进程日志、`evaluation.json` 和 `results/`。日志记录 `sim/success_rate`、成功和完成条数、完整性及耗时。发生异常或子进程超时后，错误写入评测目录，训练继续，该次成功率记为 null。仿真环境的 episode 上限与评测 tick 预算同步设置，2500 个 100 Hz tick 对应最多 25 秒。每次使用固定 seed 序列，并记录仿真 commit、映射内容及 checkpoint 指纹。
+在 policy JSON 增加 sim_eval。评测期间训练暂停，由独立 Python 子进程加载当前 step 的 actor 快照。
 
-### Slurm / Pyxis 服务器一键训练
+~~~json
+{
+  "sim_eval": {
+    "enabled": true,
+    "start_step": 10000,
+    "update_interval": 5000,
+    "weights": "ema",
+    "python": "/absolute/path/to/simulation-simple/.venv/bin/python",
+    "simulation_root": "/absolute/path/to/simulation-simple",
+    "mapping": "/absolute/path/to/dit/configs/eval_sim_block_insertion.json",
+    "device": "cuda",
+    "seed": 10000,
+    "noise_seed": 20000,
+    "episodes": 20,
+    "max_control_ticks": 2500,
+    "timeout_seconds": 3600
+  }
+}
+~~~
 
-服务器部署时将 DiT 放在家目录的 `code/dit`，挂载到容器后对应 `/root/code/dit`。编辑 `configs/server_train.json` 集中设置镜像、Python、数据路径、训练步数和评测频率。`data.dataset` 中的状态、动作索引及 stride 同时用于 critic 和 policy，`data.action_horizon` 同时设置两者的窗口长度。数据、终止标签和进度文件需要在配置指定的位置可读。
+默认关闭仿真验证。以上配置在第 10000 次更新首次评测，然后为 15000、20000……。训练结束且达到 start_step 时补评最终 step，恢复后去重。低于开始步数的短训练不会启动仿真。普通离线 FM 验证单独由 validation 配置管理。
 
-```bash
-mkdir -p ~/logs
-cd ~/code/dit
-hgpu-batch -g 1 -c 8 -m 32G -t 08:00:00 \
-  -o ~/logs/%x-%j.out \
-  -e ~/logs/%x-%j.err \
-  train.sh
-```
+结果在 actor_run/sim_eval/step_XXXXXXXX/，包含 actor.pt、evaluation.json、stdout.log、stderr.log 和 results/。日志记录成功率、成功和完成条数、完整性及耗时。异常或超时后训练继续，该次成功率为 null。训练与评测共用 GPU 时，训练模型及优化器仍占用显存。
 
-`train.sh` 在分配到的节点通过 `srun` 启动配置中的镜像，使用 `--container-remap-root --container-mount-home`。容器内使用已有的 `.venv-cu124`，加载 `critic_checkpoint` 指定的 IQL checkpoint，按保存的 reward_mode 自动选择基础 IQL 或 Dense IQL 导出，再使用 `configs/iql_fm.json` 训练 policy。导出失败会停止任务。
+## 11. 离线推理
 
-直接编辑 `configs/server_train.json`。填写 `critic_checkpoint` 为已经训练完成的 Q/V checkpoint，支持 `iql_critic` 和 `iql_dense_critic` 两种来源。窗口长度、stride、状态和动作索引及数据划分沿用该 checkpoint。通过 `data.root`、`data.labels_path` 指定数据和终止标签位置。Dense critic 额外使用 `data.progress_path`，基础 critic 无需进度文件。导出会核对来源指纹与 checkpoint 是否一致。Policy 直接使用 Q−V 权重，配置项在 `policy.advantage_weighting`。
-
-`policy.training.num_steps` 控制 BC 训练次数。`policy.sim_eval.start_step=10000` 表示从第 10000 次 policy 更新开始仿真评测，之后每隔 `update_interval` 步评测。每次提交创建独立输出目录，保存 `server.json`、`policy.json`、`advantages.jsonl` 和对应 metadata，actor checkpoint 及评测结果写入 `policy/`。
-
-
-## 项目结构
-
-```text
-dit-flow-policy/
-├── pyproject.toml              # 安装、依赖、命令行入口
-├── train.py                    # python train.py 与 awbc-train 等价
-├── configs/                    # FM、AWR-FM、smoke、overfit 配置
-├── src/
-│   ├── awbc_data/               # 轨迹读取、预处理、窗口与标签对齐
-│   ├── awbc_models/             # Vision、Observation、DiT、Objective、Euler、Policy
-│   └── awbc_training/           # Trainer、EMA、优化器、日志、恢复与推理加载
-├── tests/                      # 合成数据测试，不需要真实数据或下载预训练权重
-├── tools/                      # 已有 RoboMeter 标注流程与数据审计脚本
-└── docs/                       # 数据、架构、训练说明与历史验收记录
-```
-
-真实数据、模型权重和历史实验不打包进项目。可将数据放在 `data/`，也可直接传外部绝对路径。模型配置随安装包发布，运行不依赖旧工作区；旧模块名保留，便于恢复已有 checkpoint。
-
-## 先验证安装
-
-```bash
-pytest -q
-awbc-train --help
-# 仅使用人工观测、动作和 Advantage，FM/AWR-FM 各更新 3 次
-awbc-smoke
-```
-
-`awbc-smoke` 不读取真实机器人数据、不下载 ImageNet 权重，输出保存在当前目录的 `outputs/` 与 `artifacts/`。
-
-## 数据检查与短测试
-
-以下命令只执行 3 次 optimizer update、验证并保存 checkpoint。首次使用预训练 ResNet-18 时，torchvision 会下载 ImageNet 权重；离线服务器需提前缓存相应权重。
-
-```bash
-awbc-inspect-data --root /path/to/block_insertion_real_combined_v30_advantage \
-  --require-advantage --shuffle-episodes --seed 42
-
-awbc-train --config configs/smoke.json \
-  --set dataset.root=/path/to/block_insertion_real_combined_v30_advantage
-```
-
-`smoke.json` 使用 CPU/BF16、小 batch、0 个 worker；可分别覆盖 device 与 AMP。各配置中的相对数据、输出及自定义配置路径均相对于**命令运行目录**，CLI 覆盖遵守同一约定。跨目录或服务器运行时推荐使用绝对路径。
-
-## FM 与 AWR-FM
-
-下面是完整训练的启动接口，项目整理时没有执行完整训练：
-
-```bash
-# 普通 FM baseline
-awbc-train --config configs/fm.json \
-  --set dataset.root=/path/to/dataset \
-  --set training.device=cuda \
-  --set training.batch_size=16
-
-# AWR-FM：已经算好的 10 步窗口标签，来源信息需与实际标注相符
-awbc-train --config configs/awr_fm.json \
-  --set dataset.root=/path/to/scored_dataset
-```
-
-标注已在 Parquet `annotation.*` 中时不必另传标签表。若使用外部 JSONL/CSV/Parquet 表，增加 `--set advantage_weighting.labels_path=/path/to/chunk_advantages.jsonl`。
-
-`dataset.train_stride` 控制训练窗口起点间隔，默认 `null` 时使用动作 horizon。例如纯 FM 用 `--set policy.dit.action_horizon=40 --set dataset.train_stride=1` 每帧取一个 40 步窗口。验证起点间隔使用 horizon。更换 horizon 或 stride 时启动新实验。
-
-现有 10 步 RoboMeter 标签也支持 AWR-FM 每帧取窗。在 `configs/awr_fm.json` 上覆盖 `--set policy.dit.action_horizon=40 --set dataset.train_stride=1` 即可。与基础块边界对齐的配置直接相加原标签。其他配置将每个基础块的标签均分给它的有效动作，再对训练窗口覆盖的有效步求和。Advantage 归一化使用训练窗口统计，尾部 padding 由 mask 屏蔽。
-
-现有 RoboMeter 标注导出无需新增或改名文件：当 `labeling/advantage_metadata.json` 不存在时，入口会从已有 `labeling/summary.json` 和 `chunk_advantages.jsonl` 整理来源记录，核验存储标签的进度增量公式及其与 Parquet 标注的一致性。只读取已经算好的 Advantage，不重算标签。模型精确版本、checkpoint hash 或训练范围未知时保存为 null，并输出提示；不会把模型目录名当作精确版本，也不会自动标记来源审查完成。
-
-可通过 `--set advantage_weighting.metadata_path=/path/to/advantage_metadata.json` 显式提供来源文件，格式见 `configs/advantage_metadata.template.json`。显式路径拼写错误会报错，不自动替换；一般的外部标签表仍需要对应来源说明，不将 raw reward/progress 静默当作 Advantage。真实数据检查记录见 [数据审计](docs/data_audit/README.md)。
-
-训练默认关闭 WandB，仅写本地日志；需要时设置 `logging.use_wandb=true` 和 `logging.wandb_mode=offline/online`。AdamW、warmup/cosine、AMP、梯度累积/裁剪、EMA、验证、checkpoint 间隔都可通过 JSON 或 `--set key=value` 修改。
-
-可以直接按总优化器更新次数训练：
-
-```bash
-awbc-train --config configs/fm.json \
-  --set dataset.root=/path/to/dataset \
-  --set training.num_steps=50000
-```
-
-`num_steps` 设置后优先于 `num_epochs`，同时控制训练终点和 warmup/cosine 的总长度。未设置时继续按 epoch 预算计算；`max_updates` 仍仅用于提前停止诊断，不改变学习率调度长度。Epoch 是遍历一次训练集；step 是一次成功的 optimizer update，梯度累积的多个 minibatch 合起来才算一步，也不等于机器人动作步或 Flow 时间 t。
-
-示例配置默认 `num_steps: null`。只覆盖 dataset.root/device 不会启用 step 预算；需编辑实际传入的配置文件，或显式增加 `--set training.num_steps=50000`。启动会打印 Config source、Trainer source 和最终 Training budget。看到 `Training budget: steps=50000; num_epochs is ignored` 才表示启用了该预算；进度条中的 epoch 仍会增长，用来表示数据已遍历的轮数。`--resume` 没有同时传 `--config` 时使用 checkpoint 保存的配置，可用 `--set` 覆盖；同一次恢复保留原 scheduler 总预算。
-
-默认 tqdm 显示全局更新进度、epoch、loss、LR、速度和 ETA；AMP 跳过更新时进度不增加，resume 从保存的 global_step 接续。验证有单独 batch 进度。设置 `logging.progress_bar=false` 可关闭，CSV/JSONL/WandB 日志不受影响。
-
-FM/AWR-FM 配置默认每 1,000 次更新验证、每 5,000 次更新保存，可独立调整：
-
-```bash
-awbc-train --config configs/fm.json \
-  --set dataset.root=/path/to/dataset \
-  --set training.num_steps=50000 \
-  --set validation.update_interval=1000 \
-  --set checkpoint.update_interval=5000
-```
-
-两个 update_interval 都以成功的 optimizer update 计数，正数优先于原有 epoch 间隔，梯度累积和 AMP 跳过更新不会多计。定期保存 `step_00005000.pt` 并更新 latest，保留最近 keep_last_n 个 step 文件。到达训练终点或 max_updates 停止点时额外更新 latest，并在启用验证时补一次最终验证；同一步同时命中间隔和结束条件只验证一次。Step 模式不会在每个 epoch 再额外触发验证/保存。两个验证间隔均设为 0 时关闭验证；要恢复 epoch 频率，设 update_interval=0 并设置原 interval/save_interval。
-
-## 断点恢复
-
-```bash
-awbc-train --resume outputs/<run>/checkpoints/latest_checkpoint.pt
-# 继续一个设置了短停止点的诊断实验
-awbc-train --resume outputs/<run>/checkpoints/latest_checkpoint.pt \
-  --set training.max_updates=4
-```
-
-恢复 optimizer、scheduler、scaler、EMA、随机状态和数据位置。相同实验保持原数据划分、batch/累积与总调度；10 步新实验不覆盖以前的 16 步实验。旧 checkpoint 按保存的模型配置恢复，checkpoint 内已含视觉骨干权重，恢复和推理不需要再次下载 ImageNet 权重。
-
-每次新实验使用唯一目录，保存完整配置、模型配置、划分、训练集归一化统计、来源记录、CSV/JSONL 日志，以及 latest 和定期 checkpoint。恢复时沿用 global_step 的间隔倍数和已完成验证记录；step/epoch 同类型的定期文件各保留最近 N 个。按现有要求不实现 best checkpoint。
-
-## 离线推理接口
-
-```python
-import numpy as np
+~~~python
 from awbc_training.inference import load_policy
 
-policy = load_policy("outputs/<run>/checkpoints/latest_checkpoint.pt",
-                     use_ema=True, device="cpu")
-# 三个数组均为 uint8 RGB，键名及顺序以 policy.config.camera_names 为准
-raw_observation = {
-    "images": {
-        "observation.images.top_camera": top_rgb,
-        "observation.images.left_camera": left_rgb,
-        "observation.images.right_camera": right_rgb,
-    },
-    "state": np.asarray(robot_state, dtype=np.float32),
-}
+policy = load_policy("/path/to/actor.pt", use_ema=True, device="cpu")
+# raw_images 是相机名到原始 uint8 RGB 图像的字典。
+# raw_state 是完整原始状态向量，顺序与训练 metadata 一致。
+raw_observation = {"images": raw_images, "state": raw_state}
 observation = policy.prepare_observation(raw_observation)
-result = policy.predict_action_chunk(observation)
-actions = result["action_chunk"]  # [1, 10, action_dim]，已反归一化
-```
+prediction = policy.predict_action_chunk(observation)
+execution = policy.predict_action(observation)
+~~~
 
-如果实验未启用 EMA，使用 `use_ema=False`。这只提供离线张量推理，不包含机器人执行逻辑。
+相机名使用 policy.config.camera_names。需要对比预测块与执行块时，两个调用传入同一份 initial_noise；执行块应等于完整预测块的前 n_action_steps 步。已由 dataset 切片、归一化的 batch 直接进入模型前向。
 
-更多说明：[数据与标签](docs/DATA.md)、[模型与损失](docs/ARCHITECTURE.md)、[训练与实验](docs/TRAINING.md)、[整理与验证记录](docs/PROJECT.md)。
+## 12. 常见问题与源码
+
+| 现象 | 检查 |
+|---|---|
+| 找不到 awbc-train | 激活安装环境，或 python -m awbc_training.train |
+| CUDA 为 False | 当前 PyTorch 构建、驱动、设备可见性 |
+| Advantage 对齐失败 | critic 和 policy 的索引顺序、窗口、split、有效长度 |
+| 导出找不到旧路径 | 用 export --set 覆盖数据与标签路径 |
+| 缺少末帧进度 | 为当前实际末帧提供原始评分，复制帧显式沿用被复制帧评分 |
+| 没触发仿真验证 | enabled、start_step 及训练实际完成的更新数 |
+| success_rate 为 null | 对应 errors.jsonl、evaluation.json、stderr.log |
+| 新实验目录已存在 | 更换输出目录，继续原实验使用 --resume |
+
+src/awbc_data 负责轨迹、窗口和标签，src/awbc_models 负责模型、loss 和权重，src/awbc_training 负责训练、导出、推理与评测。
+
+更多接口见 [数据说明](docs/DATA.md)、[模型结构](docs/ARCHITECTURE.md)、[训练说明](docs/TRAINING.md) 和 [数据审计](docs/data_audit/README.md)。
