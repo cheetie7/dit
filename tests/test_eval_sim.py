@@ -192,8 +192,9 @@ def test_rollout_checks_every_tick(evaluation, outcome, tick, budget, reason, ca
         torch.testing.assert_close(policy.noises[3], policy.noises[1], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("save_video", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
-def test_cli_writes_rollouts_and_handles_incomplete_evaluation(evaluation, tmp_path, monkeypatch, failure):
+def test_cli_writes_rollouts_and_handles_incomplete_evaluation(evaluation, tmp_path, monkeypatch, failure, save_video):
     config, mapping_json, dataset_info = evaluation
     env = FakeEnv({(20, 1): "success", (21, 2): "error" if failure else "truncated"})
     policy = FakePolicy(config, env)
@@ -215,12 +216,20 @@ def test_cli_writes_rollouts_and_handles_incomplete_evaluation(evaluation, tmp_p
         "--checkpoint", str(checkpoint), "--mapping", str(mapping_path), "--dataset-root", str(tmp_path),
         "--weights", "ema", "--device", "cpu", "--seed", "20", "--noise-seed", "95",
         "--episodes", "2", "--output-dir", str(output),
-    ])
+    ] + (["--save-video"] if save_video else []))
     assert loads == [(checkpoint, True, "cpu")] and env.closed
     assert env.max_episode_steps == 2500
     assert env.seeds == [20, 21]
     records = [json.loads(row) for row in (output / "rollouts.jsonl").read_text().splitlines()]
     assert [row["noise_seed"] for row in records] == [95, 96]
+    for row in records:
+        if save_video and row['termination_reason'] != 'error':
+            assert row['video_path'] == f"videos/seed_{row['seed']}.mp4"
+            assert (output / row['video_path']).is_file()
+        else:
+            assert 'video_path' not in row
+    if not save_video:
+        assert not (output / 'videos').exists()
     summary = json.loads((output / "summary.json").read_text())
     errors = [json.loads(row) for row in (output / "errors.jsonl").read_text().splitlines()]
     assert summary["successes"] == 1 and summary["action_fps"] == 25
@@ -258,3 +267,88 @@ def test_cli_help_exits_before_loading_simulation(monkeypatch, capsys):
     with pytest.raises(SystemExit) as status:
         eval_sim.main(["--help"])
     assert status.value.code == 0 and "--max-control-ticks" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(('outcome', 'tick', 'expected'), [
+    ('success', 3, [0, 3]), ('terminated', 2, [0, 2]),
+    ('truncated', 6, [0, 4, 6]), (None, 10, [0, 4, 8, 10]),
+    ('success', 4, [0, 4]),
+])
+def test_video_decodes_action_frames_and_final_frame(evaluation, tmp_path, outcome, tick, expected):
+    import av
+
+    config, mapping, metadata = evaluation
+
+    class VideoEnv(FakeEnv):
+        def sampled_camera_observations(self, **kwargs):
+            images = super().sampled_camera_observations(**kwargs)
+            images['right_wrist_rgb'][:] = self.ticks * 20
+            return images
+
+    env = VideoEnv({(19, tick): outcome})
+    path = tmp_path / 'videos/seed_19.mp4'
+    result = eval_sim.rollout(env, FakePolicy(config, env), SimulationMapping(config, mapping, metadata),
+                              seed=19, noise_seed=50, action_fps=25, max_control_ticks=tick,
+                              video_path=path, video_camera='right_wrist_rgb')
+    assert result['termination_reason'] != 'error'
+    with av.open(str(path)) as reader:
+        assert float(reader.streams.video[0].average_rate) == 25
+        frames = [f.to_ndarray(format='rgb24') for f in reader.decode(video=0)]
+    assert len(frames) == len(expected)
+    for frame, frame_tick in zip(frames, expected, strict=True):
+        assert abs(float(frame.mean()) - frame_tick * 20) <= 3
+    assert not list(path.parent.glob('*.partial.mp4'))
+
+
+@pytest.mark.parametrize('failure', ['inference', 'capture', 'finalize'])
+def test_video_failure_removes_partial_file(evaluation, tmp_path, monkeypatch, failure):
+    config, mapping, metadata = evaluation
+    env = FakeEnv()
+    policy = FakePolicy(config, env)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError('injected failure')
+
+    if failure == 'inference':
+        monkeypatch.setattr(policy, 'predict_action', fail)
+    elif failure == 'capture':
+        monkeypatch.setattr(eval_sim.EpisodeVideo, 'capture', fail)
+    else:
+        monkeypatch.setattr(eval_sim.EpisodeVideo, 'finish', fail)
+    path = tmp_path / 'videos/seed_0.mp4'
+    result = eval_sim.rollout(env, policy, SimulationMapping(config, mapping, metadata),
+                              seed=0, noise_seed=0, action_fps=25, max_control_ticks=2, video_path=path)
+    assert result['termination_reason'] == 'error'
+    assert result['error']['stage'] == {'inference': 'predict_action', 'capture': 'video_capture',
+                                        'finalize': 'video_finalize'}[failure]
+    assert not list(path.parent.iterdir())
+
+
+def test_invalid_video_camera_fails_before_reset(evaluation, tmp_path):
+    config, mapping, metadata = evaluation
+    env = FakeEnv()
+    result = eval_sim.rollout(env, FakePolicy(config, env), SimulationMapping(config, mapping, metadata),
+                              seed=0, noise_seed=0, action_fps=25, max_control_ticks=2,
+                              video_path=tmp_path / 'video.mp4', video_camera='missing_rgb')
+    assert not env.seeds
+    assert result['error']['stage'] == 'video_setup'
+    assert 'Available cameras: eye_rgb, left_wrist_rgb, right_wrist_rgb' in result['error']['message']
+
+
+def test_video_reset_success_saves_single_frame(evaluation, tmp_path):
+    import av
+
+    config, mapping, metadata = evaluation
+
+    class ResetSuccessEnv(FakeEnv):
+        def reset(self, **kwargs):
+            observation, _ = super().reset(**kwargs)
+            return observation, {'success': True}
+
+    env = ResetSuccessEnv()
+    path = tmp_path / 'reset.mp4'
+    result = eval_sim.rollout(env, FakePolicy(config, env), SimulationMapping(config, mapping, metadata),
+                              seed=0, noise_seed=0, action_fps=25, max_control_ticks=2, video_path=path)
+    assert result['success'] and not env.commands
+    with av.open(str(path)) as reader:
+        assert len(list(reader.decode(video=0))) == 1

@@ -360,6 +360,18 @@ export PYOPENGL_PLATFORM=egl
 
 weights=raw 加载普通权重，ema 加载 EMA。每次评测用新输出目录。
 
+添加 `--save-video` 可将每个正常结束的 episode（包括失败、截断和步数上限）保存为 `<output-dir>/videos/seed_<seed>.mp4`，对应 rollouts.jsonl 记录包含相对路径 `video_path`。`--video-camera` 默认为 `eye_rgb`，无效名称会在 rollout 前报错并列出可用相机。视频使用解析出的 action FPS，包含 reset 帧、每个动作保持周期后的画面和提前结束的最后一帧。推理或录像异常时清理未完成视频，错误仍写入 errors.jsonl。
+
+单 episode 录像示例（路径均由运行时提供）：
+
+~~~bash
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl "<PYTHON_ENV>/bin/python" -m awbc_training.eval_sim \
+  --checkpoint "<CHECKPOINT.pt>" --weights ema --device cuda \
+  --dataset-root "<DATASET_ROOT>" --simulation-root "<SIMULATION_SIMPLE_ROOT>" \
+  --mapping "<DIT_ROOT>/configs/eval_sim_block_insertion.json" \
+  --episodes 1 --save-video --video-camera eye_rgb --output-dir "<NEW_OUTPUT_DIR>"
+~~~
+
 映射文件明确相机对应关系、原始状态顺序和动作语义，维度仅用于校验。默认适配本项目原始 44 维状态、16 维动作及单左臂控制。原始状态依次拼接 joint_pos、joint_vel、gripper_pos、ee_pos、ee_quat，各字段内部左臂在前。关节角用弧度、速度用弧度每秒，夹爪状态是驱动关节角；末端位置用米，四元数为 WXYZ。动作是绝对位置目标，关节用弧度，夹爪用 actuator coordinate。
 
 默认相机为 eye、left_wrist、right_wrist 的 640×480 uint8 RGB。推理接收完整原始状态，由 checkpoint 切片并归一化，反归一化动作写入选定臂，另一臂保持 reset 后的控制目标。

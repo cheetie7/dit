@@ -39,7 +39,7 @@ def evaluate_snapshot(trainer):
             "normalization_stats": trainer.stats, "global_step": trainer.global_step,
         }, checkpoint)
         command = [
-            str(Path(config.python).resolve()), "-m", "awbc_training.eval_sim",
+            str(Path(config.python).expanduser().absolute()), "-m", "awbc_training.eval_sim",
             "--checkpoint", str(checkpoint.resolve()), "--weights", config.weights,
             "--mapping", str(Path(config.mapping).resolve()),
             "--simulation-root", str(Path(config.simulation_root).resolve()),
@@ -50,8 +50,14 @@ def evaluate_snapshot(trainer):
         ]
         with (directory / "stdout.log").open("w") as stdout, (directory / "stderr.log").open("w") as stderr:
             process = subprocess.run(command, stdout=stdout, stderr=stderr, timeout=config.timeout_seconds, check=False)
-        result = json.loads((directory / "results/summary.json").read_text())
-        if process.returncode != 0 or not result["complete"]:
+        if process.returncode != 0:
+            raise RuntimeError(f"Simulation evaluation exited with code {process.returncode}; "
+                               f"stderr: {(directory / 'stderr.log').absolute()}")
+        result_path = directory / "results/summary.json"
+        if not result_path.is_file():
+            raise FileNotFoundError(f"Simulation evaluation exited with code 0 but summary.json is missing: {result_path}")
+        result = json.loads(result_path.read_text())
+        if not result["complete"]:
             raise RuntimeError(f"Simulation evaluation incomplete (exit={process.returncode}); see {directory}")
         if (result["completed_episodes"] != config.episodes
                 or not 0 <= result["successes"] <= config.episodes

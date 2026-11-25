@@ -1,6 +1,7 @@
 """Evaluate a DiT actor synchronously in simulation-simple's block insertion task."""
 
 import argparse
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -19,18 +20,91 @@ def _error(stage, exception):
     return {"stage": stage, "type": type(exception).__name__, "message": str(exception)}
 
 
-def rollout(env, policy, mapping, *, seed, noise_seed, action_fps, max_control_ticks):
+class EpisodeVideo:
+    """Stream RGB frames to PyAV; publish only after the encoder is flushed."""
+
+    def __init__(self, path, fps, camera, mapping):
+        self.path = Path(path)
+        self.pending = self.path.with_suffix(".partial.mp4")
+        self.camera, self.mapping = camera, mapping
+        self.container = None
+        try:
+            import av
+
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.container = av.open(str(self.pending), "w")
+            self.stream = self.container.add_stream("libx264", rate=Fraction(str(fps)))
+            self.stream.width, self.stream.height = mapping.width, mapping.height
+            self.stream.pix_fmt = "yuv420p"
+        except Exception:
+            self.abort()
+            raise
+
+    def capture(self, env):
+        import av
+
+        image = np.asarray(env.sampled_camera_observations(
+            width=self.mapping.width, height=self.mapping.height, include_depth=False, force=True
+        )[self.camera])
+        if image.dtype != np.uint8 or image.shape != (self.mapping.height, self.mapping.width, 3):
+            raise ValueError(f"Video camera {self.camera!r} must produce uint8 RGB frames")
+        frame = av.VideoFrame.from_ndarray(image, format="rgb24")
+        for packet in self.stream.encode(frame):
+            self.container.mux(packet)
+
+    def finish(self):
+        for packet in self.stream.encode():
+            self.container.mux(packet)
+        self.container.close()
+        self.container = None
+        self.pending.replace(self.path)
+
+    def abort(self):
+        try:
+            if self.container is not None:
+                self.container.close()
+        finally:
+            self.container = None
+            self.pending.unlink(missing_ok=True)
+
+
+def validate_video_camera(env, camera):
+    available = sorted(env.policy_image_keys)
+    if camera not in available:
+        raise ValueError(f"Unknown video camera {camera!r}. Available cameras: {', '.join(available)}")
+
+
+def rollout(env, policy, mapping, *, seed, noise_seed, action_fps, max_control_ticks,
+            video_path=None, video_camera="eye_rgb"):
     """Run one episode using the same reset targets and RNG throughout."""
     result = {"seed": seed, "noise_seed": noise_seed, "success": False, "control_ticks": 0, "inference_calls": 0}
     stage = "reset"
+    video = None
+
+    def finish(**outcome):
+        nonlocal stage
+        if video is not None:
+            stage = "video_finalize"
+            video.finish()
+        return dict(result, **outcome)
+
     try:
+        if video_path is not None:
+            stage = "video_setup"
+            validate_video_camera(env, video_camera)
+            video = EpisodeVideo(video_path, action_fps, video_camera, mapping)
+        stage = "reset"
         observation, info = env.reset(seed=seed)
+        if video is not None:
+            stage = "video_capture"
+            video.capture(env)
+        stage = "reset_target"
         target = mapping.reset_target(env)
         control_fps = float(env.control_frequency_hz)
         repeat = action_repeat(action_fps, control_fps)
         result.update(control_fps=control_fps, ticks_per_action=repeat)
         if info.get("success", False):
-            return dict(result, success=True, termination_reason="success")
+            return finish(success=True, termination_reason="success")
 
         rng = torch.Generator(device="cpu").manual_seed(noise_seed)
         while result["control_ticks"] < max_control_ticks:
@@ -49,17 +123,27 @@ def rollout(env, policy, mapping, *, seed, noise_seed, action_fps, max_control_t
             for action in actions[0]:
                 command = mapping.command(target, action)
                 stage = "step"
-                for _ in range(repeat):
+                for tick in range(repeat):
+                    stage = "step"
                     observation, _, terminated, truncated, info = env.step(command)
                     result["control_ticks"] += 1
+                    if video is not None and (tick == repeat - 1 or info["success"] or terminated or truncated
+                                              or result["control_ticks"] >= max_control_ticks):
+                        stage = "video_capture"
+                        video.capture(env)
                     if info["success"]:
-                        return dict(result, success=True, termination_reason="success")
+                        return finish(success=True, termination_reason="success")
                     if terminated or truncated:
-                        return dict(result, termination_reason="terminated" if terminated else "truncated")
+                        return finish(termination_reason="terminated" if terminated else "truncated")
                     if result["control_ticks"] >= max_control_ticks:
-                        return dict(result, termination_reason="max_control_ticks")
-        return dict(result, termination_reason="max_control_ticks")
+                        return finish(termination_reason="max_control_ticks")
+        return finish(termination_reason="max_control_ticks")
     except Exception as exception:
+        if video is not None:
+            try:
+                video.abort()
+            except Exception as cleanup_error:
+                result["video_cleanup_error"] = _error("video_cleanup", cleanup_error)
         return dict(result, success=None, termination_reason="error", error=_error(stage, exception))
 
 
@@ -128,6 +212,8 @@ def main(argv=None):
     parser.add_argument("--episodes", type=_positive_int, default=10)
     parser.add_argument("--max-control-ticks", type=_positive_int, default=2500)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--save-video", action="store_true", help="Save an MP4 for each completed episode")
+    parser.add_argument("--video-camera", default="eye_rgb", help="Simulation RGB camera to record (default: eye_rgb)")
     args = parser.parse_args(argv)
     if min(args.seed, args.noise_seed) < 0:
         parser.error("seed and noise-seed must be nonnegative")
@@ -149,9 +235,17 @@ def main(argv=None):
         env.max_episode_steps = args.max_control_ticks
         mapping.validate_environment(env)
         action_repeat(frequency, env.control_frequency_hz)
+        if args.save_video:
+            stage = "video_camera"
+            validate_video_camera(env, args.video_camera)
         for offset in range(args.episodes):
+            video_relative = Path("videos") / f"seed_{args.seed + offset}.mp4"
             record = rollout(env, policy, mapping, seed=args.seed + offset, noise_seed=args.noise_seed + offset,
-                             action_fps=frequency, max_control_ticks=args.max_control_ticks)
+                             action_fps=frequency, max_control_ticks=args.max_control_ticks,
+                             video_path=args.output_dir / video_relative if args.save_video else None,
+                             video_camera=args.video_camera)
+            if args.save_video and record["termination_reason"] != "error":
+                record["video_path"] = video_relative.as_posix()
             records.append(record)
             if "error" in record:
                 errors.append({**record["error"], "seed": record["seed"], "noise_seed": record["noise_seed"]})

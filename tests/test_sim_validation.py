@@ -126,6 +126,53 @@ def test_config_and_missing_ema(tmp_path):
     run.logger.close()
 
 
+def test_python_symlink_is_preserved(tmp_path, monkeypatch):
+    base_python = tmp_path / "base-python"
+    base_python.touch()
+    venv_python = tmp_path / "venv/bin/python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    run = enable(trainer(tmp_path, "symlink"))
+    run.config.sim_eval.python = "~/venv/bin/python"
+    commands = []
+
+    def launch(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr("awbc_training.sim_validation.subprocess.run", launch)
+    try:
+        evaluate_snapshot(run)
+        assert commands[0][0] == str(venv_python)
+        assert commands[0][0] != str(base_python)
+    finally:
+        run.logger.close()
+
+
+@pytest.mark.parametrize("exit_code", [1, 0])
+def test_missing_summary_reports_process_failure_first(tmp_path, monkeypatch, exit_code):
+    run = enable(trainer(tmp_path, "missing_summary"))
+    monkeypatch.setattr("awbc_training.sim_validation.subprocess.run",
+                        lambda command, **kwargs: SimpleNamespace(returncode=exit_code))
+    try:
+        result = evaluate_snapshot(run)
+        directory = Path(result["sim/result_directory"])
+        report = json.loads((directory / "evaluation.json").read_text())
+        assert not result["sim/complete"] and result["sim/success_rate"] is None
+        assert not (directory / "results/summary.json").exists()
+        message = report["error"]["message"]
+        if exit_code:
+            assert report["error"]["type"] == "RuntimeError"
+            assert "code 1" in message
+            assert str(directory / "stderr.log") in message
+        else:
+            assert report["error"]["type"] == "FileNotFoundError"
+            assert "summary.json is missing" in message and "code 0" in message
+    finally:
+        run.logger.close()
+
+
 def test_real_child_process_loads_snapshot_without_mujoco(tmp_path, monkeypatch):
     import sys
     monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
