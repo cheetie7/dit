@@ -113,7 +113,8 @@ def test_q_padding_and_ordered_update():
     assert metrics["td_target_mean"] == pytest.approx(expected_target.mean().item())
 
 
-def test_cli_train_resume_and_export(root, tmp_path):
+@pytest.mark.parametrize("mode", ["shared_frozen", "separate_trainable"])
+def test_cli_train_resume_and_export(root, tmp_path, mode):
     path = root / "episodes.jsonl"
     labels = [dict(episode_index=i, end_type="terminated", success=True, end_frame_index=13) for i in range(2)]
     path.write_text("".join(json.dumps(row) + "\n" for row in labels))
@@ -122,6 +123,7 @@ def test_cli_train_resume_and_export(root, tmp_path):
         "dataset": {"root": str(root), "stratify_key": None, "train_stride": 3},
         "labels_path": str(path), "image_preprocess": {"size": [24, 32]},
         "action_horizon": 4, "pretrained": False, "hidden_dims": [16],
+        "vision_encoder_mode": mode,
         "num_steps": 2, "batch_size": 2, "device": "cpu",
         "logging": {"use_wandb": False, "log_interval": 1, "progress_bar": False},
     }))
@@ -130,6 +132,15 @@ def test_cli_train_resume_and_export(root, tmp_path):
     checkpoint = directory / "checkpoints/latest_checkpoint.pt"
     first = torch.load(checkpoint, weights_only=False)
     assert (first["global_step"], first["epoch"], first["batch_in_epoch"]) == (2, 0, 2)
+    assert first["model_config"]["vision_encoder_mode"] == mode
+    if mode == "shared_frozen":
+        # Old checkpoints lack this option and retain the original backbone keys.
+        first["config"].pop("vision_encoder_mode")
+        first["model_config"].pop("vision_encoder_mode")
+        torch.save(first, checkpoint)
+    other_mode = "shared_frozen" if mode == "separate_trainable" else "separate_trainable"
+    with pytest.raises(ValueError, match="architecture"):
+        main(["train", "--resume", str(checkpoint), "--set", f"vision_encoder_mode={other_mode}"])
     assert first["v_optimizer"]["state"] and first["q_optimizer"]["state"]
     assert first["rng_state"]["torch"].dtype == torch.uint8
     for override, pattern in (("seed=17", "checkpoint's seed"), ("gamma=0.9", "gamma"),
@@ -160,6 +171,7 @@ def test_cli_train_resume_and_export(root, tmp_path):
     main(["export", "--checkpoint", str(checkpoint), "--output", str(output)])
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     metadata = json.loads(output.with_suffix(".metadata.json").read_text())
+    assert metadata["vision_encoder_mode"] == mode
     assert metadata["split"] == resumed["split"]
     assert metadata["checkpoint"]["global_step"] == 5
     assert metadata["data_contract"]["train_stride"] == 3
@@ -170,9 +182,9 @@ def test_cli_train_resume_and_export(root, tmp_path):
     model.load_state_dict(resumed["critic"])
     batch = next(iter(DataLoader(train, batch_size=len(train))))
     with torch.no_grad():
-        features = model.encode(batch["observation"])
+        features = model.encode(batch["observation"], target=True)
         q1, q2 = model.action_values(features, batch["action"], batch["action_is_pad"], target=True)
-        expected = torch.minimum(q1, q2) - model.v(features)
+        expected = torch.minimum(q1, q2) - model.v(model.encode(batch["observation"], branch="v"))
     keys = [(row["trajectory_id"], row["start_timestep"], row["action_horizon"]) for row in rows]
     assert len(set(keys)) == len(rows) == len(train) == metadata["record_count"]
     assert keys == list(zip(batch["episode_index"].tolist(), batch["frame_index"].tolist(), [4] * len(train)))
@@ -181,3 +193,76 @@ def test_cli_train_resume_and_export(root, tmp_path):
         assert row["end_timestep"] == row["start_timestep"] + length
         assert row["advantage"] == pytest.approx(value.item(), abs=1e-6)
     train.dataset.close()
+
+
+def test_separate_trainable_gradient_isolation_and_target_update():
+    from torchvision.ops.misc import FrozenBatchNorm2d
+
+    torch.manual_seed(11)
+    config = IQLConfig(labels_path="", pretrained=False, hidden_dims=(8,),
+                       vision_encoder_mode="separate_trainable", target_update_rate=0.25)
+    model = IQLCritic(IQLCriticConfig(2, 2, 3, 4, config.hidden_dims, pretrained=False,
+                                     vision_encoder_mode=config.vision_encoder_mode))
+    trainer = IQLTrainer(config, model, torch.device("cpu"))
+    model.train()
+    observation = {"images": torch.randn(2, 2, 3, 32, 32), "state": torch.randn(2, 2)}
+    batch = dict(observation=observation, next_observation=observation,
+                 action=torch.randn(2, 4, 3), action_is_pad=torch.tensor([[False]*3+[True], [False]*4]),
+                 reward=torch.tensor([0.2, 1.]), discount=torch.tensor([0.8, 0.9]),
+                 bootstrap_mask=torch.tensor([1., 0.]), terminated=torch.tensor([False, True]),
+                 truncated=torch.tensor([False, False]))
+    v_before, q_before = parameters(model.v_backbone), parameters(model.q_backbone)
+    target_before = parameters(model.target_backbone)
+    head_before = parameters(model.target_q)
+    assert same_parameters(model.target_backbone, q_before)
+    v_ids = {id(p) for p in model.value_parameters()}
+    q_ids = {id(p) for p in model.q_parameters()}
+    assert not v_ids & q_ids
+    assert v_ids | q_ids == {id(p) for p in model.parameters() if p.requires_grad}
+    for backbone in (model.q_backbone, model.v_backbone, model.target_backbone):
+        assert any(isinstance(m, FrozenBatchNorm2d) for m in backbone.modules())
+    assert all(p.requires_grad for b in (model.q_backbone, model.v_backbone) for p in b.parameters())
+
+    _, loss = trainer.value_loss(observation, batch["action"], batch["action_is_pad"])
+    loss.backward()
+    assert all(p.grad is not None for p in model.value_parameters())
+    assert all(p.grad is None for p in model.q_parameters())
+    trainer.v_optimizer.step()
+    assert not same_parameters(model.v_backbone, v_before)
+    assert same_parameters(model.q_backbone, q_before)
+    assert same_parameters(model.target_backbone, target_before)
+    trainer.v_optimizer.zero_grad(set_to_none=True)
+    v_after = parameters(model.v_backbone)
+    with patch.object(model.q_backbone, "forward", wraps=model.q_backbone.forward) as encode:
+        _, _, _, loss = trainer.q_loss(batch, observation, batch["action"], batch["action_is_pad"])
+        loss.backward()
+        assert encode.call_count == 1  # Both Q heads consume the same visual features.
+    assert all(p.grad is not None for p in model.q_parameters())
+    assert all(p.grad is None for p in model.value_parameters())
+    trainer.q_optimizer.step()
+    assert not same_parameters(model.q_backbone, q_before)
+    assert same_parameters(model.v_backbone, v_after)
+    assert same_parameters(model.target_backbone, target_before)
+    assert same_parameters(model.target_q, head_before)
+    assert not model.target_backbone.training and not model.target_q.training
+    assert all(not p.requires_grad and p.grad is None
+               for module in (model.target_backbone, model.target_q) for p in module.parameters())
+    model.update_target(0.25)
+    for target_module, online_module, previous in ((model.target_backbone, model.q_backbone, target_before),
+                                                  (model.target_q, model.q, head_before)):
+        for target, online, old in zip(target_module.parameters(), online_module.parameters(), previous, strict=True):
+            torch.testing.assert_close(target, 0.75 * old + 0.25 * online)
+    for name, buffer in model.target_backbone.named_buffers():
+        torch.testing.assert_close(buffer, model.q_backbone.get_buffer(name), rtol=0, atol=0)
+
+    with torch.no_grad():
+        features = model.encode(observation)
+        changed = batch["action"].masked_fill(batch["action_is_pad"].unsqueeze(-1), 999.)
+        for original, padded in zip(model.action_values(features, batch["action"], batch["action_is_pad"]),
+                                    model.action_values(features, changed, batch["action_is_pad"]), strict=True):
+            torch.testing.assert_close(original, padded, rtol=0, atol=0)
+
+
+def test_invalid_vision_encoder_mode():
+    with pytest.raises(ValueError, match="vision_encoder_mode"):
+        IQLCriticConfig(1, 2, 3, 4, vision_encoder_mode="unknown")

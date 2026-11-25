@@ -44,6 +44,7 @@ class IQLConfig:
     v_learning_rate: float = 3e-4
     hidden_dims: tuple[int, ...] = (256, 256)
     pretrained: bool = True
+    vision_encoder_mode: str = "shared_frozen"
     seed: int = 42
     num_steps: int = 10_000
     batch_size: int = 16
@@ -136,7 +137,7 @@ def _prepare(config):
     source = train.dataset.source
     model_config = IQLCriticConfig(
         len(source.cameras), source.state_selection["state_dim"], source.action_selection["action_dim"],
-        config.action_horizon, config.hidden_dims, config.pretrained,
+        config.action_horizon, config.hidden_dims, config.pretrained, config.vision_encoder_mode,
     )
     contract = {
         "action_horizon": config.action_horizon,
@@ -177,7 +178,7 @@ def _check_data(state, stats, split, contract, model_config):
             raise ValueError(f"Dataset {key} differs from the checkpoint")
     if state["split"] != split or state["normalization_stats"] != stats:
         raise ValueError("Dataset split or normalization statistics differ from the checkpoint")
-    if state["model_config"] != asdict(model_config):
+    if asdict(IQLCriticConfig(**state["model_config"])) != asdict(model_config):
         raise ValueError("Critic architecture or initialization configuration differs from the checkpoint")
 
 
@@ -186,8 +187,8 @@ class IQLTrainer:
         self.config = config
         self.model = model.to(device=device, dtype=torch.float32)
         self.device = device
-        self.v_optimizer = torch.optim.Adam(self.model.v.parameters(), lr=config.v_learning_rate)
-        self.q_optimizer = torch.optim.Adam(self.model.q.parameters(), lr=config.q_learning_rate)
+        self.v_optimizer = torch.optim.Adam(self.model.value_parameters(), lr=config.v_learning_rate)
+        self.q_optimizer = torch.optim.Adam(self.model.q_parameters(), lr=config.q_learning_rate)
         self.global_step = self.epoch = self.batch_in_epoch = 0
 
     def state_dict(self):
@@ -201,6 +202,8 @@ class IQLTrainer:
         for key in ("seed", "batch_size", "expectile", "target_update_rate", "v_learning_rate", "q_learning_rate"):
             if state["config"][key] != getattr(self.config, key):
                 raise ValueError(f"Resume must keep the checkpoint's {key}")
+        if state["config"].get("vision_encoder_mode", "shared_frozen") != self.config.vision_encoder_mode:
+            raise ValueError("Resume must keep the checkpoint's vision_encoder_mode")
         self.model.load_state_dict(state["critic"])
         self.v_optimizer.load_state_dict(state["v_optimizer"])
         self.q_optimizer.load_state_dict(state["q_optimizer"])
@@ -209,22 +212,23 @@ class IQLTrainer:
         self.batch_in_epoch = state["batch_in_epoch"]
         restore_rng(state["rng_state"])
 
-    def value_loss(self, features, action, mask):
+    def value_loss(self, observation, action, mask):
         with torch.no_grad():
+            features = self.model.encode(observation, target=True)
             q1, q2 = self.model.action_values(features, action, mask, target=True)
-        value = self.model.v(features)
+        value = self.model.v(self.model.encode(observation, branch="v"))
         return value, expectile_loss(torch.minimum(q1, q2) - value, self.config.expectile)
 
-    def q_loss(self, batch, features, action, mask):
-        target = td_target(batch, lambda obs: self.model.v(self.model.encode(obs)))
+    def q_loss(self, batch, observation, action, mask):
+        target = td_target(batch, lambda obs: self.model.v(self.model.encode(obs, branch="v")))
+        features = self.model.encode(observation)
         q1, q2 = self.model.action_values(features, action, mask)
         loss = (q1 - target).square().mean() + (q2 - target).square().mean()
         return q1, q2, target, loss
 
     def step(self, batch):
         self.model.train()
-        features = self.model.encode(batch["observation"])
-        inputs = features, batch["action"], batch["action_is_pad"]
+        inputs = batch["observation"], batch["action"], batch["action_is_pad"]
 
         self.v_optimizer.zero_grad(set_to_none=True)
         value, v_loss = self.value_loss(*inputs)
@@ -246,7 +250,7 @@ class IQLTrainer:
         totals = _MetricTotals()
         for batch in loader:
             batch = move_batch(batch, self.device)
-            inputs = self.model.encode(batch["observation"]), batch["action"], batch["action_is_pad"]
+            inputs = batch["observation"], batch["action"], batch["action_is_pad"]
             value, v_loss = self.value_loss(*inputs)
             q1, q2, target, q_loss = self.q_loss(batch, *inputs)
             totals.add(_metrics(batch, value, q1, q2, target, v_loss, q_loss), len(value))
@@ -368,6 +372,7 @@ def export_advantages(checkpoint, output, device=None, *, config_type=IQLConfig,
         "checkpoint": {"path": str(checkpoint.resolve()), "sha256": checkpoint_hash,
                        "global_step": state["global_step"]},
         "split": split, "data_contract": contract, "reward_labels_path": config.labels_path,
+        "vision_encoder_mode": config.vision_encoder_mode,
         "record_count": len(seen), "advantage_definition": "min(target_q1, target_q2) - v",
     }
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")

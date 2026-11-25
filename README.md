@@ -162,6 +162,43 @@ python -m awbc_training.iql_dense train \
   --run-dir "$critic_run"
 ~~~
 
+### 可选：分别训练 Q 和 V 的视觉编码器
+
+两份 critic 配置默认 `vision_encoder_mode="shared_frozen"`，保持共享冻结 ResNet-18，兼容缺少此字段的旧 checkpoint。第一步解冻实验设置 `vision_encoder_mode="separate_trainable"`：Q1/Q2 共享一个可训练 ResNet-18，V 使用另一个独立可训练 ResNet-18，保留 FrozenBatchNorm；每个相机的特征仍池化至 2×2，再按相机顺序展平并拼接 state。两个编码器均使用 `pretrained` 指定的现有初始化方式。
+
+设置数据目录后，分别启动 sparse 或 dense 实验：
+
+~~~bash
+export DATASET_ROOT="<DATASET_ROOT>"
+
+python -m awbc_training.iql train \
+  --config configs/iql_critic.json \
+  --set dataset.root="$DATASET_ROOT" \
+  --set labels_path="$DATASET_ROOT/episode_end_labels.jsonl" \
+  --set vision_encoder_mode=separate_trainable \
+  --run-dir outputs/iql_separate_trainable
+
+python -m awbc_training.iql_dense train \
+  --config configs/iql_dense_critic.json \
+  --set dataset.root="$DATASET_ROOT" \
+  --set labels_path="$DATASET_ROOT/episode_end_labels.jsonl" \
+  --set progress_path="$DATASET_ROOT/boundary_progress_iql.jsonl" \
+  --set vision_encoder_mode=separate_trainable \
+  --run-dir outputs/iql_dense_separate_trainable
+~~~
+
+V loss 仅更新 V 编码器和 V head；Q loss 仅更新共享 Q 编码器和两个 Q head。target Q 编码器与 heads 从在线 Q 复制初始化，参数统一按 `target ← (1−ρ) target + ρ online` 更新，目标计算无梯度。奖励、TD target 和 MLP 不变。模式保存在 checkpoint 配置及 Advantage metadata 中；恢复时必须保持模式一致。导出命令与下节相同，计算 `min(target_Q1,target_Q2)−V` 时分别使用 target Q 编码器和 V 编码器。
+
+按当前配置的 3 相机、8 维 state、8 维 action、horizon=10、隐藏层 [256,256]，参数量如下；状态、相机数或 horizon 改变时，head 参数量随之变化。
+
+| 分支 | separate_trainable 可训练参数 | shared_frozen 可训练参数 |
+| --- | ---: | ---: |
+| V 编码器 + V head | 12,808,129 | 1,641,217 |
+| 共享 Q 编码器 + Q1/Q2 heads | 14,495,426 | 3,328,514 |
+| target Q 编码器 + heads | 0 | 0 |
+
+每个 ResNet-18 编码器含 11,166,912 个参数；新模式在线可训练参数合计 27,303,555，target Q 保存 14,495,426 个冻结参数。FrozenBatchNorm 的固定统计量不计入可训练参数。
+
 默认 10000 次更新、batch 16。CPU 设置 device=cpu。需要 stride=2 时增加 --set dataset.train_stride=2。训练步数及保留 checkpoint 数量可直接编辑 critic JSON，例如：
 
 ~~~json

@@ -138,7 +138,8 @@ def test_zero_shaping_matches_sparse_batch_and_td_target(trajectory):
     assert shaped["reward_dense"].abs().sum() > 0
 
 
-def test_dense_cli_checkpoint_and_iql_fm_export(root, tmp_path):
+@pytest.mark.parametrize("mode", ["shared_frozen", "separate_trainable"])
+def test_dense_cli_checkpoint_and_iql_fm_export(root, tmp_path, mode):
     ends = jsonl(tmp_path / "ends.jsonl", [
         dict(episode_index=e, success=e == 0, end_type="terminated", end_frame_index=13) for e in range(2)
     ])
@@ -150,6 +151,7 @@ def test_dense_cli_checkpoint_and_iql_fm_export(root, tmp_path):
         "dataset": data_settings, "image_preprocess": image_preprocess,
         "labels_path": str(ends), "action_horizon": 4, "num_steps": 1, "batch_size": 2,
         "pretrained": False, "hidden_dims": [8], "device": "cpu",
+        "vision_encoder_mode": mode,
         "logging": {"use_wandb": False, "progress_bar": False},
     }
     config = tmp_path / "dense.json"
