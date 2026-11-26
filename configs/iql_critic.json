@@ -18,6 +18,7 @@
   "hidden_dims": [256, 256],
   "pretrained": true,
   "vision_encoder_mode": "shared_frozen",
+  "vision_feature_mode": "avg_pool_2x2",
   "seed": 42,
   "num_steps": 10000,
   "batch_size": 16,

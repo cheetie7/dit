@@ -199,6 +199,37 @@ V loss 仅更新 V 编码器和 V head；Q loss 仅更新共享 Q 编码器和�
 
 每个 ResNet-18 编码器含 11,166,912 个参数；新模式在线可训练参数合计 27,303,555，target Q 保存 14,495,426 个冻结参数。FrozenBatchNorm 的固定统计量不计入可训练参数。
 
+### 第二步：Spatial Softmax 视觉特征
+
+顶层 `vision_feature_mode` 默认为 `avg_pool_2x2`，保持第一步的特征处理和旧 checkpoint 兼容。第二步使用 `separate_trainable` 与 `spatial_softmax` 的组合，开启新 run：
+
+~~~bash
+export DATASET_ROOT="<DATASET_ROOT>"
+
+python -m awbc_training.iql train \
+  --config configs/iql_critic.json \
+  --set dataset.root="$DATASET_ROOT" \
+  --set labels_path="$DATASET_ROOT/episode_end_labels.jsonl" \
+  --set vision_encoder_mode=separate_trainable \
+  --set vision_feature_mode=spatial_softmax \
+  --run-dir outputs/iql_spatial_softmax
+
+python -m awbc_training.iql_dense train \
+  --config configs/iql_dense_critic.json \
+  --set dataset.root="$DATASET_ROOT" \
+  --set labels_path="$DATASET_ROOT/episode_end_labels.jsonl" \
+  --set progress_path="$DATASET_ROOT/boundary_progress_iql.jsonl" \
+  --set vision_encoder_mode=separate_trainable \
+  --set vision_feature_mode=spatial_softmax \
+  --run-dir outputs/iql_dense_spatial_softmax
+~~~
+
+相机按数据集顺序沿 RGB 通道拼接为 `[B,3N,H,W]`；ResNet-18 的首层 RGB 卷积核重复 N 次并除以 N，其他 stride、FrozenBatchNorm 和预训练初始化方式保持不变。layer4 输出的每个通道独立在空间位置上做温度 1 的 softmax，然后在 `[-1,1]` 网格上计算期望坐标。x 从左到右递增，y 从上到下递增；1024 维向量顺序为 `(x0,y0,x1,y1,...)`，再通过 `Linear(1024,50) → LayerNorm(50) → tanh`。
+
+50 维视觉特征直接拼接归一化 state：8 维 state 时 V 输入为 58 维；8 维 action、horizon=40 时 Q 输入为 `58 + 40×8 + 40 = 418` 维。上述命令沿用配置中的 horizon、stride、MLP、奖励和 TD 目标设置。
+
+Q1/Q2 共享 ResNet 和投影，V 的 ResNet 和投影独立；target Q 的 ResNet、投影及两个 heads 一起 Polyak 更新。checkpoint 和 Advantage metadata 保存 `vision_feature_mode`，恢复时禁止改变模式。旧 checkpoint 缺少该字段按 `avg_pool_2x2` 解释。Spatial Softmax checkpoint 的恢复及导出仍使用原有 sparse/dense 子命令，导出的 Advantage 仍为 `min(target_Q1,target_Q2)−V`，policy 标签格式不变。
+
 默认 10000 次更新、batch 16。CPU 设置 device=cpu。需要 stride=2 时增加 --set dataset.train_stride=2。训练步数及保留 checkpoint 数量可直接编辑 critic JSON，例如：
 
 ~~~json

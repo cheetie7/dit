@@ -113,17 +113,22 @@ def test_q_padding_and_ordered_update():
     assert metrics["td_target_mean"] == pytest.approx(expected_target.mean().item())
 
 
-@pytest.mark.parametrize("mode", ["shared_frozen", "separate_trainable"])
-def test_cli_train_resume_and_export(root, tmp_path, mode):
+@pytest.mark.parametrize(("mode", "feature_mode"), [
+    ("shared_frozen", "avg_pool_2x2"),
+    ("separate_trainable", "avg_pool_2x2"),
+    ("separate_trainable", "spatial_softmax"),
+])
+def test_cli_train_resume_and_export(root, tmp_path, mode, feature_mode):
     path = root / "episodes.jsonl"
     labels = [dict(episode_index=i, end_type="terminated", success=True, end_frame_index=13) for i in range(2)]
     path.write_text("".join(json.dumps(row) + "\n" for row in labels))
+    image_size = (64, 64) if feature_mode == "spatial_softmax" else (24, 32)
     config_path = tmp_path / "iql.json"
     config_path.write_text(json.dumps({
         "dataset": {"root": str(root), "stratify_key": None, "train_stride": 3},
-        "labels_path": str(path), "image_preprocess": {"size": [24, 32]},
+        "labels_path": str(path), "image_preprocess": {"size": image_size},
         "action_horizon": 4, "pretrained": False, "hidden_dims": [16],
-        "vision_encoder_mode": mode,
+        "vision_encoder_mode": mode, "vision_feature_mode": feature_mode,
         "num_steps": 2, "batch_size": 2, "device": "cpu",
         "logging": {"use_wandb": False, "log_interval": 1, "progress_bar": False},
     }))
@@ -133,14 +138,23 @@ def test_cli_train_resume_and_export(root, tmp_path, mode):
     first = torch.load(checkpoint, weights_only=False)
     assert (first["global_step"], first["epoch"], first["batch_in_epoch"]) == (2, 0, 2)
     assert first["model_config"]["vision_encoder_mode"] == mode
+    assert first["model_config"]["vision_feature_mode"] == feature_mode
+    if feature_mode == "avg_pool_2x2":
+        first["config"].pop("vision_feature_mode")
+        first["model_config"].pop("vision_feature_mode")
     if mode == "shared_frozen":
         # Old checkpoints lack this option and retain the original backbone keys.
         first["config"].pop("vision_encoder_mode")
         first["model_config"].pop("vision_encoder_mode")
-        torch.save(first, checkpoint)
+    torch.save(first, checkpoint)
     other_mode = "shared_frozen" if mode == "separate_trainable" else "separate_trainable"
     with pytest.raises(ValueError, match="architecture"):
-        main(["train", "--resume", str(checkpoint), "--set", f"vision_encoder_mode={other_mode}"])
+        main(["train", "--resume", str(checkpoint), "--set", f"vision_encoder_mode={other_mode}",
+              "--set", "vision_feature_mode=avg_pool_2x2"])
+    if mode == "separate_trainable":
+        other_feature = "spatial_softmax" if feature_mode == "avg_pool_2x2" else "avg_pool_2x2"
+        with pytest.raises(ValueError, match="architecture"):
+            main(["train", "--resume", str(checkpoint), "--set", f"vision_feature_mode={other_feature}"])
     assert first["v_optimizer"]["state"] and first["q_optimizer"]["state"]
     assert first["rng_state"]["torch"].dtype == torch.uint8
     for override, pattern in (("seed=17", "checkpoint's seed"), ("gamma=0.9", "gamma"),
@@ -172,12 +186,13 @@ def test_cli_train_resume_and_export(root, tmp_path, mode):
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     metadata = json.loads(output.with_suffix(".metadata.json").read_text())
     assert metadata["vision_encoder_mode"] == mode
+    assert metadata["vision_feature_mode"] == feature_mode
     assert metadata["split"] == resumed["split"]
     assert metadata["checkpoint"]["global_step"] == 5
     assert metadata["data_contract"]["train_stride"] == 3
     assert metadata["data_contract"]["labels_sha256"] == resumed["data_contract"]["labels_sha256"]
     train, _, _, _ = prepare_datasets(DatasetConfig(root=str(root), stratify_key=None, train_stride=3),
-                                     ImagePreprocessConfig(size=(24, 32)), action_horizon=4)
+                                     ImagePreprocessConfig(size=image_size), action_horizon=4)
     model = IQLCritic(replace(IQLCriticConfig(**resumed["model_config"]), pretrained=False)).eval()
     model.load_state_dict(resumed["critic"])
     batch = next(iter(DataLoader(train, batch_size=len(train))))
@@ -195,22 +210,26 @@ def test_cli_train_resume_and_export(root, tmp_path, mode):
     train.dataset.close()
 
 
-def test_separate_trainable_gradient_isolation_and_target_update():
+@pytest.mark.parametrize("feature_mode", ["avg_pool_2x2", "spatial_softmax"])
+def test_separate_trainable_gradient_isolation_and_target_update(feature_mode):
     from torchvision.ops.misc import FrozenBatchNorm2d
 
     torch.manual_seed(11)
     config = IQLConfig(labels_path="", pretrained=False, hidden_dims=(8,),
-                       vision_encoder_mode="separate_trainable", target_update_rate=0.25)
+                       vision_encoder_mode="separate_trainable", vision_feature_mode=feature_mode, target_update_rate=0.25)
     model = IQLCritic(IQLCriticConfig(2, 2, 3, 4, config.hidden_dims, pretrained=False,
-                                     vision_encoder_mode=config.vision_encoder_mode))
+                                     vision_encoder_mode=config.vision_encoder_mode, vision_feature_mode=feature_mode))
     trainer = IQLTrainer(config, model, torch.device("cpu"))
     model.train()
-    observation = {"images": torch.randn(2, 2, 3, 32, 32), "state": torch.randn(2, 2)}
+    observation = {"images": torch.randn(2, 2, 3, 64, 64), "state": torch.randn(2, 2)}
     batch = dict(observation=observation, next_observation=observation,
                  action=torch.randn(2, 4, 3), action_is_pad=torch.tensor([[False]*3+[True], [False]*4]),
                  reward=torch.tensor([0.2, 1.]), discount=torch.tensor([0.8, 0.9]),
                  bootstrap_mask=torch.tensor([1., 0.]), terminated=torch.tensor([False, True]),
                  truncated=torch.tensor([False, False]))
+    if feature_mode == "spatial_softmax":
+        v_projection_before = parameters(model.v_backbone.projection)
+        q_projection_before = parameters(model.q_backbone.projection)
     v_before, q_before = parameters(model.v_backbone), parameters(model.q_backbone)
     target_before = parameters(model.target_backbone)
     head_before = parameters(model.target_q)
@@ -228,6 +247,10 @@ def test_separate_trainable_gradient_isolation_and_target_update():
     assert all(p.grad is not None for p in model.value_parameters())
     assert all(p.grad is None for p in model.q_parameters())
     trainer.v_optimizer.step()
+    if feature_mode == "spatial_softmax":
+        assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in model.v_backbone.projection.parameters())
+        assert not same_parameters(model.v_backbone.projection, v_projection_before)
+        assert model.v_backbone.backbone.body["conv1"].weight.grad.abs().sum() > 0
     assert not same_parameters(model.v_backbone, v_before)
     assert same_parameters(model.q_backbone, q_before)
     assert same_parameters(model.target_backbone, target_before)
@@ -240,6 +263,10 @@ def test_separate_trainable_gradient_isolation_and_target_update():
     assert all(p.grad is not None for p in model.q_parameters())
     assert all(p.grad is None for p in model.value_parameters())
     trainer.q_optimizer.step()
+    if feature_mode == "spatial_softmax":
+        assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in model.q_backbone.projection.parameters())
+        assert not same_parameters(model.q_backbone.projection, q_projection_before)
+        assert model.q_backbone.backbone.body["conv1"].weight.grad.abs().sum() > 0
     assert not same_parameters(model.q_backbone, q_before)
     assert same_parameters(model.v_backbone, v_after)
     assert same_parameters(model.target_backbone, target_before)
@@ -266,3 +293,80 @@ def test_separate_trainable_gradient_isolation_and_target_update():
 def test_invalid_vision_encoder_mode():
     with pytest.raises(ValueError, match="vision_encoder_mode"):
         IQLCriticConfig(1, 2, 3, 4, vision_encoder_mode="unknown")
+
+
+def test_spatial_softmax_coordinate_direction_and_uniform_map():
+    from awbc_models.iql_critic import SpatialSoftmax
+
+    softmax = SpatialSoftmax()
+    torch.testing.assert_close(softmax(torch.zeros(1, 2, 3, 5)), torch.zeros(1, 4), atol=1e-7, rtol=0)
+    features = torch.full((1, 2, 3, 5), -80.)
+    features[0, 0, 0, 4] = 80.  # Top-right: x=+1, y=-1.
+    features[0, 1, 2, 0] = 80.  # Bottom-left: x=-1, y=+1.
+    torch.testing.assert_close(softmax(features), torch.tensor([[1., -1., -1., 1.]]))
+    # Non-saturated example checks temperature=1 and both coordinate axes.
+    logits = torch.tensor([[[[0., 1.], [2., 3.]]]])
+    probability = logits.flatten().softmax(0)
+    expected = torch.stack(((probability * torch.tensor([-1., 1., -1., 1.])).sum(),
+                            (probability * torch.tensor([-1., -1., 1., 1.])).sum()))[None]
+    torch.testing.assert_close(softmax(logits), expected)
+
+
+@pytest.mark.parametrize("num_cameras", [1, 3])
+def test_spatial_encoder_expands_rgb_weights_without_changing_resnet(num_cameras):
+    from awbc_models.iql_critic import SpatialVisualEncoder
+    from awbc_models.vision import ResNet18Backbone
+
+    original = ResNet18Backbone(pretrained=False, mode="all")
+    rgb_conv = original.body["conv1"]
+    rgb_weight = rgb_conv.weight.detach().clone()
+    with patch("awbc_models.iql_critic.ResNet18Backbone", return_value=original) as initialize:
+        encoder = SpatialVisualEncoder(num_cameras, pretrained=True)
+    initialize.assert_called_once_with(pretrained=True, mode="all")
+    expanded = encoder.backbone.body["conv1"]
+    assert expanded.in_channels == 3 * num_cameras
+    assert (expanded.stride, expanded.padding, expanded.kernel_size) == (
+        rgb_conv.stride, rgb_conv.padding, rgb_conv.kernel_size
+    )
+    torch.testing.assert_close(expanded.weight, rgb_weight.repeat(1, num_cameras, 1, 1) / num_cameras)
+    assert encoder.backbone.body["layer4"][-1].conv2.out_channels == 512
+    assert isinstance(encoder.projection[0], torch.nn.Linear)
+    assert isinstance(encoder.projection[1], torch.nn.LayerNorm)
+    assert isinstance(encoder.projection[2], torch.nn.Tanh)
+
+
+def test_spatial_three_camera_fusion_dimensions_and_advantage():
+    model = IQLCritic(IQLCriticConfig(3, 8, 8, 40, pretrained=False,
+                                     vision_encoder_mode="separate_trainable",
+                                     vision_feature_mode="spatial_softmax")).eval()
+    observation = {"images": torch.randn(2, 3, 3, 64, 96), "state": torch.randn(2, 8)}
+    action = torch.randn(2, 40, 8)
+    padding = torch.zeros(2, 40, dtype=torch.bool)
+    assert model.v[0].in_features == 58
+    assert all(head[0].in_features == 418 for head in (*model.q, *model.target_q))
+    conv = model.q_backbone.backbone.body["conv1"]
+    with torch.no_grad(), patch.object(conv, "forward", wraps=conv.forward) as first_conv:
+        features = model.encode(observation)
+        q1, q2 = model.action_values(features, action, padding)
+        assert first_conv.call_count == 1
+        stacked = first_conv.call_args.args[0]
+        assert stacked.shape == (2, 9, 64, 96)
+        for camera in range(3):
+            torch.testing.assert_close(stacked[:, camera * 3:(camera + 1) * 3],
+                                        observation["images"][:, camera])
+        assert features.shape == (2, 58)
+        assert features[:, :50].abs().max() <= 1
+        torch.testing.assert_close(features[:, 50:], observation["state"])
+        assert q1.shape == q2.shape == (2,)
+        target_features = model.encode(observation, target=True)
+        tq1, tq2 = model.action_values(target_features, action, padding, target=True)
+        expected = torch.minimum(tq1, tq2) - model.v(model.encode(observation, branch="v"))
+        torch.testing.assert_close(model.advantage(dict(observation=observation, action=action,
+                                                      action_is_pad=padding)), expected)
+
+
+def test_invalid_vision_feature_mode():
+    with pytest.raises(ValueError, match="vision_feature_mode"):
+        IQLCriticConfig(3, 8, 8, 40, vision_feature_mode="unknown")
+    with pytest.raises(ValueError, match="requires vision_encoder_mode=separate_trainable"):
+        IQLCriticConfig(3, 8, 8, 40, vision_feature_mode="spatial_softmax")

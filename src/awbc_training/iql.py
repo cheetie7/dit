@@ -45,6 +45,7 @@ class IQLConfig:
     hidden_dims: tuple[int, ...] = (256, 256)
     pretrained: bool = True
     vision_encoder_mode: str = "shared_frozen"
+    vision_feature_mode: str = "avg_pool_2x2"
     seed: int = 42
     num_steps: int = 10_000
     batch_size: int = 16
@@ -137,7 +138,8 @@ def _prepare(config):
     source = train.dataset.source
     model_config = IQLCriticConfig(
         len(source.cameras), source.state_selection["state_dim"], source.action_selection["action_dim"],
-        config.action_horizon, config.hidden_dims, config.pretrained, config.vision_encoder_mode,
+        config.action_horizon, config.hidden_dims, config.pretrained,
+        config.vision_encoder_mode, config.vision_feature_mode,
     )
     contract = {
         "action_horizon": config.action_horizon,
@@ -202,8 +204,9 @@ class IQLTrainer:
         for key in ("seed", "batch_size", "expectile", "target_update_rate", "v_learning_rate", "q_learning_rate"):
             if state["config"][key] != getattr(self.config, key):
                 raise ValueError(f"Resume must keep the checkpoint's {key}")
-        if state["config"].get("vision_encoder_mode", "shared_frozen") != self.config.vision_encoder_mode:
-            raise ValueError("Resume must keep the checkpoint's vision_encoder_mode")
+        for key, default in (("vision_encoder_mode", "shared_frozen"), ("vision_feature_mode", "avg_pool_2x2")):
+            if state["config"].get(key, default) != getattr(self.config, key):
+                raise ValueError(f"Resume must keep the checkpoint's {key}")
         self.model.load_state_dict(state["critic"])
         self.v_optimizer.load_state_dict(state["v_optimizer"])
         self.q_optimizer.load_state_dict(state["q_optimizer"])
@@ -373,6 +376,7 @@ def export_advantages(checkpoint, output, device=None, *, config_type=IQLConfig,
                        "global_step": state["global_step"]},
         "split": split, "data_contract": contract, "reward_labels_path": config.labels_path,
         "vision_encoder_mode": config.vision_encoder_mode,
+        "vision_feature_mode": config.vision_feature_mode,
         "record_count": len(seen), "advantage_definition": "min(target_q1, target_q2) - v",
     }
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")

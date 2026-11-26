@@ -138,20 +138,24 @@ def test_zero_shaping_matches_sparse_batch_and_td_target(trajectory):
     assert shaped["reward_dense"].abs().sum() > 0
 
 
-@pytest.mark.parametrize("mode", ["shared_frozen", "separate_trainable"])
-def test_dense_cli_checkpoint_and_iql_fm_export(root, tmp_path, mode):
+@pytest.mark.parametrize(("mode", "feature_mode"), [
+    ("shared_frozen", "avg_pool_2x2"),
+    ("separate_trainable", "avg_pool_2x2"),
+    ("separate_trainable", "spatial_softmax"),
+])
+def test_dense_cli_checkpoint_and_iql_fm_export(root, tmp_path, mode, feature_mode):
     ends = jsonl(tmp_path / "ends.jsonl", [
         dict(episode_index=e, success=e == 0, end_type="terminated", end_frame_index=13) for e in range(2)
     ])
     raw_rows = [progress_row(e, frame, value) for e in range(2) for frame, value in [(0, 0.2), (13, 0.5)]]
     progress = jsonl(tmp_path / "progress.jsonl", raw_rows)
     data_settings = {"root": str(root), "stratify_key": None, "train_stride": 2}
-    image_preprocess = {"size": [24, 32]}
+    image_preprocess = {"size": [64, 64] if feature_mode == "spatial_softmax" else [24, 32]}
     common = {
         "dataset": data_settings, "image_preprocess": image_preprocess,
         "labels_path": str(ends), "action_horizon": 4, "num_steps": 1, "batch_size": 2,
         "pretrained": False, "hidden_dims": [8], "device": "cpu",
-        "vision_encoder_mode": mode,
+        "vision_encoder_mode": mode, "vision_feature_mode": feature_mode,
         "logging": {"use_wandb": False, "progress_bar": False},
     }
     config = tmp_path / "dense.json"
@@ -160,6 +164,7 @@ def test_dense_cli_checkpoint_and_iql_fm_export(root, tmp_path, mode):
     dense_main(["train", "--config", str(config), "--run-dir", str(run)])
     checkpoint = run / "checkpoints/latest_checkpoint.pt"
     state = torch.load(checkpoint, weights_only=False)
+    assert state["model_config"]["vision_feature_mode"] == feature_mode
     contract = state["data_contract"]
     assert contract["reward_mode"] == "dense"
     assert contract["reward_definition"] == "discounted_sparse_terminal_success_plus_single_gamma_potential_difference_v1"
@@ -186,7 +191,9 @@ def test_dense_cli_checkpoint_and_iql_fm_export(root, tmp_path, mode):
     dense_main(["export", "--checkpoint", str(checkpoint), "--output", str(output),
                 "--set", f"dataset.root={root}"])
     metadata_path = output.with_suffix(".metadata.json")
-    assert json.loads(metadata_path.read_text())["data_contract"]["reward_mode"] == "dense"
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["data_contract"]["reward_mode"] == "dense"
+    assert metadata["vision_feature_mode"] == feature_mode
     train, _, _, split = prepare_datasets(
         DatasetConfig(**data_settings), ImagePreprocessConfig(**image_preprocess), action_horizon=4
     )

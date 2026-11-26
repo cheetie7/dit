@@ -416,3 +416,41 @@ def test_cli_overrides_use_existing_configuration_style(tmp_path):
     assert loaded.training.batch_size == 3 and loaded.optimizer.learning_rate == 2e-4
     assert not loaded.logging.use_wandb
     assert loaded.policy["vision"]["backbone_mode"] == "layer4"
+
+
+@pytest.mark.parametrize("legacy_checkpoint", [False, True])
+def test_resume_extends_step_budget_without_restarting_lr_schedule(tmp_path, legacy_checkpoint):
+    first = trainer(tmp_path, "extend_first", num_steps=4, max_updates=2)
+    first.fit()
+    checkpoint = torch.load(first.directory / "checkpoints/latest_checkpoint.pt", weights_only=False)
+    expected_factors = [first.scheduler.lr_lambdas[0](step) for step in range(9)]
+    first.logger.close()
+    assert checkpoint["scheduler_total_steps"] == 4
+    if legacy_checkpoint:
+        checkpoint.pop("scheduler_total_steps")
+
+    resumed = trainer(tmp_path, "extend_resumed", num_steps=6, max_updates=None, state=checkpoint)
+    try:
+        assert resumed.total_steps == 6 and resumed.scheduler_total_steps == 4
+        assert resumed.global_step == resumed.scheduler.last_epoch == resumed.ema.num_updates == 2
+        assert [group["lr"] for group in resumed.optimizer.param_groups] == [
+            group["lr"] for group in checkpoint["optimizer"]["param_groups"]
+        ]
+        assert [resumed.scheduler.lr_lambdas[0](step) for step in range(9)] == expected_factors
+        resumed.fit()
+        assert resumed.global_step == resumed.scheduler.last_epoch == resumed.ema.num_updates == 6
+        saved = torch.load(resumed.directory / "checkpoints/latest_checkpoint.pt", weights_only=False)
+        assert saved["total_steps"] == 6 and saved["scheduler_total_steps"] == 4
+    finally:
+        resumed.logger.close()
+
+    extended_again = trainer(tmp_path, "extend_again", num_steps=8, max_updates=None, state=saved)
+    try:
+        assert extended_again.scheduler_total_steps == 4
+        assert [extended_again.scheduler.lr_lambdas[0](step) for step in range(9)] == expected_factors
+    finally:
+        extended_again.logger.close()
+    with pytest.raises(ValueError, match="extend it with training.num_steps"):
+        trainer(tmp_path, "extend_shrink", num_steps=5, state=saved)
+    with pytest.raises(ValueError, match="extend it with training.num_steps"):
+        trainer(tmp_path, "extend_epochs_only", epochs=10, state=saved)

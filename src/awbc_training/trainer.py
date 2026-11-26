@@ -33,7 +33,11 @@ class Trainer:
                             else self.updates_per_epoch*config.training.num_epochs)
         if self.total_steps <= 0:
             raise ValueError("The training update budget must be positive")
-        self.scheduler = build_scheduler(self.optimizer, config.scheduler, self.total_steps)
+        # Resuming with a larger stopping budget keeps the checkpoint's LR schedule.
+        self.scheduler_total_steps = self.total_steps
+        if resume_state is not None:
+            self.scheduler_total_steps = resume_state.get("scheduler_total_steps", resume_state["total_steps"])
+        self.scheduler = build_scheduler(self.optimizer, config.scheduler, self.scheduler_total_steps)
         self.precision = Precision(config.amp, device)
         self.ema = EMA(self.policy, config.ema.decay) if config.ema.enabled else None
         self.epoch = self.batch_in_epoch = self.global_step = 0
@@ -133,7 +137,8 @@ class Trainer:
                 "policy_config": asdict(self.policy.config), "rng_state": rng_state(),
                 "epoch_loss_sum": self.epoch_loss_sum, "epoch_samples": self.epoch_samples,
                 "epoch_seconds": self.epoch_seconds, "fixed_pair": self.fixed_pair,
-                "total_steps": self.total_steps, "last_update_metrics": self.last_update_metrics,
+                "total_steps": self.total_steps, "scheduler_total_steps": self.scheduler_total_steps,
+                "last_update_metrics": self.last_update_metrics,
                 "advantage_weighting": self.weighting.state_dict() if self.weighting else None,
                 "epoch_awr_rows": self.epoch_awr_rows, "epoch_weighted_sum": self.epoch_weighted_sum,
                 "epoch_weight_sum": self.epoch_weight_sum,
@@ -158,8 +163,10 @@ class Trainer:
                 raise ValueError("Resume must retain the original Dense AWBC weight configuration")
         if state["normalization_stats"] != self.stats or state["split"] != self.manifest:
             raise ValueError("Resume dataset split/statistics differ from the checkpoint")
-        if state["total_steps"] != self.total_steps:
-            raise ValueError("Resume must retain the original total optimizer-update budget")
+        if self.total_steps != state["total_steps"] and (
+            self.config.training.num_steps is None or self.total_steps < state["total_steps"]
+        ):
+            raise ValueError("Resume must retain the update budget or extend it with training.num_steps")
         if state["config"].get("advantage_weighting", {}) != asdict(self.config.advantage_weighting) and self.weighting:
             raise ValueError("Resume must retain the original advantage normalization/weighting configuration")
         if any(original[key] != getattr(self.config.training, key)
